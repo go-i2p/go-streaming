@@ -206,6 +206,41 @@ func main() {
 
 **See [QUICKREF.md](QUICKREF.md) for a one-page reference guide!**
 
+## Known Limitations
+
+This is an **MVP (Minimum Viable Product)** implementation focused on correctness over performance. The following features are not yet implemented:
+
+### Reliability & Error Handling
+
+- **No robust retransmission**: Simplified retransmission with fixed timeout. Packet loss may cause stalls.
+- **Out-of-order packets dropped**: No packet reordering buffer. Packets must arrive in sequence.
+- **No NACK support**: Negative acknowledgments not implemented.
+- **Limited RST handling**: Connection resets are basic.
+
+### Performance & Optimization
+
+- **Fixed window size**: Uses 6-packet window initially. No dynamic window sizing or congestion control.
+- **No slow start/congestion avoidance**: Does not implement TCP-style congestion control algorithms.
+- **No control block sharing**: Each connection independently estimates RTT/window size.
+- **Simple buffering**: Uses basic buffers; not optimized for high throughput.
+
+### Protocol Features
+
+- **No ECHO/ping-pong**: Keepalive packets not implemented. Idle connections rely on I2CP timeouts.
+- **No choking mechanism**: Flow control signals (optional delay >60000ms) not fully implemented.
+- **No half-close**: FIN flag not supported; use CLOSE for connection termination.
+- **No profile support**: Bulk vs. interactive profiles not implemented.
+- **Single connection optimization**: StreamManager supports multiplexing but not optimized for many connections.
+
+### Production Readiness
+
+- **Limited testing**: 67.8% test coverage. Integration tests pass, but real-world edge cases not fully explored.
+- **No metrics/monitoring**: No built-in observability (Prometheus, etc.).
+- **No connection pooling**: Each connection requires separate handshake.
+- **IPv6/ECIES optimization**: ECIES MTU (1812) supported but not extensively tested.
+
+**These limitations are intentional for the MVP.** Future versions will address them based on real-world usage and feedback. See [ROADMAP.md](ROADMAP.md) for planned enhancements.
+
 ## Documentation
 
 - **[QUICKREF.md](QUICKREF.md)** - One-page quick reference for SessionCallbacks integration ⭐
