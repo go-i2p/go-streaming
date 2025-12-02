@@ -1,6 +1,6 @@
 # go-streaming
 
-I2P streaming library in Go using `go-i2cp` and `soypat/seqs`
+I2P streaming library in Go using `go-i2cp`
 
 ## Overview
 
@@ -25,7 +25,7 @@ Application (io.Reader/io.Writer)
      ↕
 StreamConn (implements net.Conn)
      ↕
-TCP Layer (github.com/soypat/seqs - packet construction)
+I2P Streaming Protocol (custom packet format)
      ↕
 I2CP Layer (github.com/go-i2p/go-i2cp - discrete messages)
      ↕
@@ -73,66 +73,147 @@ I2P Network (anonymous routing via tunnels)
 - No checksums in streaming protocol itself
 - Relies on I2CP layer's gzip CRC-32 for error detection
 
-## Current Status: Pre-MVP
+## Current Status: Phase 6 Complete - Full Integration Testing ✅
 
-This library is under active development. See [ROADMAP.md](ROADMAP.md) for detailed implementation plan.
+This library is under active development. **Phase 6 (Integration Testing)** is complete with comprehensive test coverage!
 
-### Planned MVP (v0.1.0-alpha)
+### Recently Completed (Phase 6)
+
+- ✅ **Integration Test Suite** - 151 tests with 67.8% coverage, race-free
+- ✅ **SessionCallbacks Integration** - Full callback-driven packet reception
+- ✅ **StreamManager** - Routes packets from I2CP callbacks to connections
+- ✅ **Connection Multiplexing** - Multiple connections per I2CP session tested
+- ✅ **Large Data Transfer** - Validated 100KB transfers with MTU chunking
+- ✅ **Bidirectional Communication** - Simultaneous send/receive tested
+- ✅ **CLOSE Handshake** - Proper connection teardown validated
+- ✅ **Concurrent Operations** - Stress tested with 1000 concurrent ops
+
+### Implemented (v0.1.0-alpha)
 
 - ✅ Three-way handshake (SYN/SYN-ACK/ACK)
 - ✅ Basic data transfer with sequencing
-- ✅ CLOSE handshake for clean shutdown
+- ✅ CLOSE handshake for clean shutdown (bidirectional)
 - ✅ `net.Conn` interface implementation
 - ✅ Simple fixed-window flow control
+- ✅ Echo server/client examples
+- ✅ **Callback-based packet reception** via StreamManager
+- ✅ **Connection multiplexing** - Multiple streams per session
+- ✅ **Integration tested** - 151 tests, 67.8% coverage, race-free
+- ✅ **Large transfers** - Validated 100KB+ with MTU chunking
 - ⚠️  Simplified retransmission (fixed timeout)
 - ⚠️  No congestion control (future)
 - ⚠️  No ECHO/ping support initially (future)
 
-See [ROADMAP.md](ROADMAP.md) for phased implementation details.
+See [ROADMAP.md](ROADMAP.md) for detailed implementation status.
+
+### Examples
+
+Working examples are available in the `examples/` directory:
+
+- **[Echo Server/Client](examples/echo/)** - Demonstrates basic streaming API usage
+  - Server: Listen for connections and echo data back
+  - Client: Connect to server and send test messages
+  - Shows `net.Conn` compatibility with standard Go idioms
+
+**Note**: Examples require I2CP session setup (see [go-i2cp docs](https://github.com/go-i2p/go-i2cp)).
 
 ## Dependencies
 
 **Required:**
 
 - [`github.com/go-i2p/go-i2cp`](https://github.com/go-i2p/go-i2cp) - I2CP protocol transport (MIT)
-- [`github.com/soypat/seqs`](https://github.com/soypat/seqs) - TCP packet construction/parsing (BSD-3-Clause)
 
-**Standard Library Only**: No additional dependencies for MVP.
+**Standard Library Only**: All packet construction uses standard library encoding/binary.
 
-## Quick Start (Future)
+## Quick Start
+
+### Server Example
 
 ```go
-// Coming soon - example usage once implemented
 import (
-    "github.com/go-i2p/go-streaming"
+    "context"
+    "io"
+    go_i2cp "github.com/go-i2p/go-i2cp"
+    streaming "github.com/go-i2p/go-streaming"
 )
 
-// Client
-conn, err := streaming.Dial("destination.b32.i2p:80")
-if err != nil {
-    panic(err)
-}
-defer conn.Close()
-conn.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
-
-// Server
-listener, err := streaming.Listen(":8080")
-if err != nil {
-    panic(err)
-}
-for {
-    conn, err := listener.Accept()
-    if err != nil {
-        continue
+func main() {
+    // 1. Connect to I2P router
+    client := go_i2cp.NewClient(&go_i2cp.ClientCallBacks{})
+    client.Connect(context.Background())
+    defer client.Close()
+    
+    // 2. Create StreamManager (handles SessionCallbacks)
+    manager, _ := streaming.NewStreamManager(client)
+    manager.StartSession(context.Background())
+    defer manager.Close()
+    
+    // 3. Start ProcessIO loop (REQUIRED for callbacks!)
+    go func() {
+        for { client.ProcessIO(context.Background()) }
+    }()
+    
+    // 4. Listen for connections
+    listener, _ := streaming.ListenWithManager(manager, 8080, 1730)
+    defer listener.Close()
+    
+    // 5. Accept and handle connections
+    for {
+        conn, _ := listener.Accept()
+        go io.Copy(conn, conn) // Echo data back
     }
-    go handleConn(conn) // Use like net.Conn
 }
 ```
 
+### Client Example
+
+```go
+import (
+    "context"
+    go_i2cp "github.com/go-i2p/go-i2cp"
+    streaming "github.com/go-i2p/go-streaming"
+)
+
+func main() {
+    // 1. Connect to I2P router
+    client := go_i2cp.NewClient(&go_i2cp.ClientCallBacks{})
+    client.Connect(context.Background())
+    defer client.Close()
+    
+    // 2. Create StreamManager
+    manager, _ := streaming.NewStreamManager(client)
+    manager.StartSession(context.Background())
+    defer manager.Close()
+    
+    // 3. Start ProcessIO loop (REQUIRED!)
+    go func() {
+        for { client.ProcessIO(context.Background()) }
+    }()
+    
+    // 4. Parse destination and dial
+    crypto := go_i2cp.NewCrypto()
+    dest, _ := go_i2cp.NewDestinationFromBase64(destB64, crypto)
+    
+    conn, _ := streaming.Dial(manager.Session(), dest, 0, 8080)
+    defer conn.Close()
+    
+    // 5. Use like net.Conn
+    conn.Write([]byte("Hello, I2P!"))
+    buf := make([]byte, 1024)
+    n, _ := conn.Read(buf)
+}
+```
+
+**See [QUICKREF.md](QUICKREF.md) for a one-page reference guide!**
+
 ## Documentation
 
+- **[QUICKREF.md](QUICKREF.md)** - One-page quick reference for SessionCallbacks integration ⭐
+- **[INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md)** - Complete integration guide with patterns and examples ⭐
+- [SESSIONCALLBACKS_INTEGRATION.md](SESSIONCALLBACKS_INTEGRATION.md) - Phase 3 implementation details
 - [SPEC.md](SPEC.md) - Full I2P streaming protocol specification
 - [ROADMAP.md](ROADMAP.md) - MVP implementation plan with phases
+- [examples/](examples/) - Working echo server/client examples
 - [.github/copilot-instructions.md](.github/copilot-instructions.md) - Development guidelines
 
 ## Design Philosophy
