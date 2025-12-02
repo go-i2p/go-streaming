@@ -25,7 +25,7 @@ func TestPacketMarshal(t *testing.T) {
 				AckThrough:   99,
 				Flags:        FlagSYN,
 			},
-			wantLen: 21, // 4+4+4+4+1+2+2 = 21 bytes
+			wantLen: 23, // 4+4+4+4+1+2+2+2 = 23 bytes (added 2-byte Option Size)
 			check: func(t *testing.T, data []byte) {
 				assert.Equal(t, uint32(1), binary.BigEndian.Uint32(data[0:4]), "SendStreamID")
 				assert.Equal(t, uint32(2), binary.BigEndian.Uint32(data[4:8]), "RecvStreamID")
@@ -33,6 +33,7 @@ func TestPacketMarshal(t *testing.T) {
 				assert.Equal(t, uint32(99), binary.BigEndian.Uint32(data[12:16]), "AckThrough")
 				assert.Equal(t, uint8(0), data[16], "NACKCount")
 				assert.Equal(t, FlagSYN, binary.BigEndian.Uint16(data[19:21]), "Flags")
+				assert.Equal(t, uint16(0), binary.BigEndian.Uint16(data[21:23]), "Option Size")
 			},
 		},
 		{
@@ -45,9 +46,9 @@ func TestPacketMarshal(t *testing.T) {
 				Flags:        FlagACK,
 				Payload:      []byte("hello"),
 			},
-			wantLen: 26, // 21 + 5 bytes payload
+			wantLen: 28, // 23 + 5 bytes payload
 			check: func(t *testing.T, data []byte) {
-				assert.Equal(t, []byte("hello"), data[21:], "Payload")
+				assert.Equal(t, []byte("hello"), data[23:], "Payload")
 			},
 		},
 		{
@@ -57,12 +58,13 @@ func TestPacketMarshal(t *testing.T) {
 				RecvStreamID:  2,
 				SequenceNum:   1,
 				AckThrough:    0,
-				Flags:         FlagACK,
+				Flags:         FlagACK | FlagDelayRequested,
 				OptionalDelay: 1000, // 1 second delay
 			},
-			wantLen: 23, // 21 + 2 bytes optional delay
+			wantLen: 25, // 23 + 2 bytes optional delay
 			check: func(t *testing.T, data []byte) {
-				assert.Equal(t, uint16(1000), binary.BigEndian.Uint16(data[21:23]), "OptionalDelay")
+				assert.Equal(t, uint16(2), binary.BigEndian.Uint16(data[21:23]), "Option Size")
+				assert.Equal(t, uint16(1000), binary.BigEndian.Uint16(data[23:25]), "OptionalDelay")
 			},
 		},
 		{
@@ -72,12 +74,13 @@ func TestPacketMarshal(t *testing.T) {
 				RecvStreamID:  2,
 				SequenceNum:   1,
 				AckThrough:    0,
-				Flags:         FlagACK,
+				Flags:         FlagACK | FlagDelayRequested,
 				OptionalDelay: 60001, // Indicates choking
 			},
-			wantLen: 23,
+			wantLen: 25,
 			check: func(t *testing.T, data []byte) {
-				assert.Equal(t, uint16(60001), binary.BigEndian.Uint16(data[21:23]), "OptionalDelay (choked)")
+				assert.Equal(t, uint16(2), binary.BigEndian.Uint16(data[21:23]), "Option Size")
+				assert.Equal(t, uint16(60001), binary.BigEndian.Uint16(data[23:25]), "OptionalDelay (choked)")
 			},
 		},
 		{
@@ -89,7 +92,7 @@ func TestPacketMarshal(t *testing.T) {
 				AckThrough:   0,
 				Flags:        FlagSYN | FlagACK,
 			},
-			wantLen: 21,
+			wantLen: 23,
 			check: func(t *testing.T, data []byte) {
 				assert.Equal(t, FlagSYN|FlagACK, binary.BigEndian.Uint16(data[19:21]), "Flags")
 			},
@@ -206,11 +209,11 @@ func TestPacketMarshalLargePayload(t *testing.T) {
 	data, err := pkt.Marshal()
 	require.NoError(t, err, "Marshal should not fail")
 
-	expectedLen := 21 + DefaultMTU
+	expectedLen := 23 + DefaultMTU
 	assert.Equal(t, expectedLen, len(data), "Marshal length")
 
 	// Verify payload integrity
-	assert.Equal(t, payload, data[21:], "Payload should not be corrupted")
+	assert.Equal(t, payload, data[23:], "Payload should not be corrupted")
 }
 
 // TestPacketMarshalZeroValues verifies handling of zero-value fields.
@@ -245,7 +248,7 @@ func TestPacketUnmarshal(t *testing.T) {
 			name: "minimal packet (no payload, no optional fields)",
 			data: func() []byte {
 				// Manually construct a minimal packet
-				buf := make([]byte, 21)
+				buf := make([]byte, 23)
 				binary.BigEndian.PutUint32(buf[0:], 1)        // SendStreamID
 				binary.BigEndian.PutUint32(buf[4:], 2)        // RecvStreamID
 				binary.BigEndian.PutUint32(buf[8:], 100)      // SequenceNum
@@ -253,6 +256,7 @@ func TestPacketUnmarshal(t *testing.T) {
 				buf[16] = 0                                   // NACKCount
 				binary.BigEndian.PutUint16(buf[17:], 0)       // ResendDelay
 				binary.BigEndian.PutUint16(buf[19:], FlagSYN) // Flags
+				binary.BigEndian.PutUint16(buf[21:], 0)       // Option Size
 				return buf
 			}(),
 			want: &Packet{
@@ -264,9 +268,9 @@ func TestPacketUnmarshal(t *testing.T) {
 			},
 		},
 		{
-			name: "packet with payload (OptionalDelay not detected - MVP limitation)",
+			name: "packet with payload",
 			data: func() []byte {
-				buf := make([]byte, 21)
+				buf := make([]byte, 23)
 				binary.BigEndian.PutUint32(buf[0:], 10)
 				binary.BigEndian.PutUint32(buf[4:], 20)
 				binary.BigEndian.PutUint32(buf[8:], 1000)
@@ -274,6 +278,7 @@ func TestPacketUnmarshal(t *testing.T) {
 				buf[16] = 0
 				binary.BigEndian.PutUint16(buf[17:], 0)
 				binary.BigEndian.PutUint16(buf[19:], FlagACK)
+				binary.BigEndian.PutUint16(buf[21:], 0) // Option Size
 				buf = append(buf, []byte("hello")...)
 				return buf
 			}(),
@@ -283,22 +288,22 @@ func TestPacketUnmarshal(t *testing.T) {
 				SequenceNum:  1000,
 				AckThrough:   999,
 				Flags:        FlagACK,
-				// OptionalDelay: 0, // MVP limitation - not detected when payload present
-				Payload: []byte("hello"),
+				Payload:      []byte("hello"),
 			},
 		},
 		{
-			name: "packet with optional delay (no payload - works correctly)",
+			name: "packet with optional delay",
 			data: func() []byte {
-				buf := make([]byte, 23)
+				buf := make([]byte, 25)
 				binary.BigEndian.PutUint32(buf[0:], 1)
 				binary.BigEndian.PutUint32(buf[4:], 2)
 				binary.BigEndian.PutUint32(buf[8:], 1)
 				binary.BigEndian.PutUint32(buf[12:], 0)
 				buf[16] = 0
 				binary.BigEndian.PutUint16(buf[17:], 0)
-				binary.BigEndian.PutUint16(buf[19:], FlagACK)
-				binary.BigEndian.PutUint16(buf[21:], 1000) // OptionalDelay
+				binary.BigEndian.PutUint16(buf[19:], FlagACK|FlagDelayRequested)
+				binary.BigEndian.PutUint16(buf[21:], 2)    // Option Size
+				binary.BigEndian.PutUint16(buf[23:], 1000) // OptionalDelay
 				return buf
 			}(),
 			want: &Packet{
@@ -306,22 +311,23 @@ func TestPacketUnmarshal(t *testing.T) {
 				RecvStreamID:  2,
 				SequenceNum:   1,
 				AckThrough:    0,
-				Flags:         FlagACK,
+				Flags:         FlagACK | FlagDelayRequested,
 				OptionalDelay: 1000,
 			},
 		},
 		{
-			name: "choked packet (optional delay > 60000, no payload - works correctly)",
+			name: "choked packet (optional delay > 60000)",
 			data: func() []byte {
-				buf := make([]byte, 23)
+				buf := make([]byte, 25)
 				binary.BigEndian.PutUint32(buf[0:], 1)
 				binary.BigEndian.PutUint32(buf[4:], 2)
 				binary.BigEndian.PutUint32(buf[8:], 1)
 				binary.BigEndian.PutUint32(buf[12:], 0)
 				buf[16] = 0
 				binary.BigEndian.PutUint16(buf[17:], 0)
-				binary.BigEndian.PutUint16(buf[19:], FlagACK)
-				binary.BigEndian.PutUint16(buf[21:], 60001) // Choking indicator
+				binary.BigEndian.PutUint16(buf[19:], FlagACK|FlagDelayRequested)
+				binary.BigEndian.PutUint16(buf[21:], 2)     // Option Size
+				binary.BigEndian.PutUint16(buf[23:], 60001) // Choking indicator
 				return buf
 			}(),
 			want: &Packet{
@@ -329,14 +335,14 @@ func TestPacketUnmarshal(t *testing.T) {
 				RecvStreamID:  2,
 				SequenceNum:   1,
 				AckThrough:    0,
-				Flags:         FlagACK,
+				Flags:         FlagACK | FlagDelayRequested,
 				OptionalDelay: 60001,
 			},
 		},
 		{
 			name: "multiple flags",
 			data: func() []byte {
-				buf := make([]byte, 21)
+				buf := make([]byte, 23)
 				binary.BigEndian.PutUint32(buf[0:], 1)
 				binary.BigEndian.PutUint32(buf[4:], 2)
 				binary.BigEndian.PutUint32(buf[8:], 1)
@@ -344,6 +350,7 @@ func TestPacketUnmarshal(t *testing.T) {
 				buf[16] = 0
 				binary.BigEndian.PutUint16(buf[17:], 0)
 				binary.BigEndian.PutUint16(buf[19:], FlagSYN|FlagACK)
+				binary.BigEndian.PutUint16(buf[21:], 0) // Option Size
 				return buf
 			}(),
 			want: &Packet{
@@ -356,13 +363,13 @@ func TestPacketUnmarshal(t *testing.T) {
 		},
 		{
 			name:    "packet too short (error case)",
-			data:    make([]byte, 20), // Need at least 21 bytes
+			data:    make([]byte, 22), // Need at least 23 bytes
 			wantErr: true,
 		},
 		{
 			name: "packet with NACK count (error case - not supported)",
 			data: func() []byte {
-				buf := make([]byte, 21)
+				buf := make([]byte, 23)
 				binary.BigEndian.PutUint32(buf[0:], 1)
 				binary.BigEndian.PutUint32(buf[4:], 2)
 				binary.BigEndian.PutUint32(buf[8:], 1)
@@ -370,14 +377,15 @@ func TestPacketUnmarshal(t *testing.T) {
 				buf[16] = 5 // Non-zero NACK count
 				binary.BigEndian.PutUint16(buf[17:], 0)
 				binary.BigEndian.PutUint16(buf[19:], FlagACK)
+				binary.BigEndian.PutUint16(buf[21:], 0) // Option Size
 				return buf
 			}(),
 			wantErr: true,
 		},
 		{
-			name: "large payload (MTU size - OptionalDelay not detected)",
+			name: "large payload (MTU size)",
 			data: func() []byte {
-				buf := make([]byte, 21)
+				buf := make([]byte, 23)
 				binary.BigEndian.PutUint32(buf[0:], 1)
 				binary.BigEndian.PutUint32(buf[4:], 2)
 				binary.BigEndian.PutUint32(buf[8:], 1)
@@ -385,6 +393,7 @@ func TestPacketUnmarshal(t *testing.T) {
 				buf[16] = 0
 				binary.BigEndian.PutUint16(buf[17:], 0)
 				binary.BigEndian.PutUint16(buf[19:], FlagACK)
+				binary.BigEndian.PutUint16(buf[21:], 0) // Option Size
 
 				payload := make([]byte, DefaultMTU)
 				for i := range payload {
@@ -435,7 +444,9 @@ func TestPacketUnmarshal(t *testing.T) {
 // TestPacketUnmarshalBigEndian verifies all multi-byte fields are parsed as big-endian.
 func TestPacketUnmarshalBigEndian(t *testing.T) {
 	// Construct packet with known big-endian values
-	data := make([]byte, 21)
+	// Use flags that don't include FlagDelayRequested (bit 8) or FlagMaxPacketSizeIncluded (bit 9)
+	// to avoid needing option data
+	data := make([]byte, 23)
 	// SendStreamID: 0x12345678
 	data[0], data[1], data[2], data[3] = 0x12, 0x34, 0x56, 0x78
 	// RecvStreamID: 0x9ABCDEF0
@@ -448,8 +459,10 @@ func TestPacketUnmarshalBigEndian(t *testing.T) {
 	data[16] = 0
 	// ResendDelay: 0x1234
 	data[17], data[18] = 0x12, 0x34
-	// Flags: 0xABCD
-	data[19], data[20] = 0xAB, 0xCD
+	// Flags: 0x00FF (lower 8 bits set, avoiding bits 8 and 9)
+	data[19], data[20] = 0x00, 0xFF
+	// Option Size: 0
+	data[21], data[22] = 0x00, 0x00
 
 	pkt := &Packet{}
 	err := pkt.Unmarshal(data)
@@ -460,20 +473,14 @@ func TestPacketUnmarshalBigEndian(t *testing.T) {
 	assert.Equal(t, uint32(0xFEDCBA98), pkt.SequenceNum, "SequenceNum")
 	assert.Equal(t, uint32(0x76543210), pkt.AckThrough, "AckThrough")
 	assert.Equal(t, uint16(0x1234), pkt.ResendDelay, "ResendDelay")
-	assert.Equal(t, uint16(0xABCD), pkt.Flags, "Flags")
+	assert.Equal(t, uint16(0x00FF), pkt.Flags, "Flags")
 }
 
 // TestPacketRoundTrip verifies Marshal/Unmarshal are inverse operations.
-//
-// **MVP Limitation**: OptionalDelay does not round-trip when payload is present.
-// This is a known limitation documented in Unmarshal(). Packets without payload
-// round-trip correctly. For packets with payload, we only verify headers and payload.
 func TestPacketRoundTrip(t *testing.T) {
 	tests := []struct {
 		name   string
 		packet *Packet
-		// skipOptDelay indicates whether to skip OptionalDelay comparison (true for packets with payload)
-		skipOptDelay bool
 	}{
 		{
 			name: "minimal packet",
@@ -486,7 +493,7 @@ func TestPacketRoundTrip(t *testing.T) {
 			},
 		},
 		{
-			name: "packet with payload (OptionalDelay won't round-trip)",
+			name: "packet with payload",
 			packet: &Packet{
 				SendStreamID: 10,
 				RecvStreamID: 20,
@@ -495,32 +502,31 @@ func TestPacketRoundTrip(t *testing.T) {
 				Flags:        FlagACK,
 				Payload:      []byte("test data"),
 			},
-			skipOptDelay: true, // MVP limitation
 		},
 		{
-			name: "packet with optional delay (no payload - rounds trip correctly)",
+			name: "packet with optional delay",
 			packet: &Packet{
 				SendStreamID:  1,
 				RecvStreamID:  2,
 				SequenceNum:   1,
 				AckThrough:    0,
-				Flags:         FlagACK,
+				Flags:         FlagACK | FlagDelayRequested,
 				OptionalDelay: 500,
 			},
 		},
 		{
-			name: "choked packet (no payload - rounds trip correctly)",
+			name: "choked packet",
 			packet: &Packet{
 				SendStreamID:  1,
 				RecvStreamID:  2,
 				SequenceNum:   1,
 				AckThrough:    0,
-				Flags:         FlagACK,
+				Flags:         FlagACK | FlagDelayRequested,
 				OptionalDelay: 60001,
 			},
 		},
 		{
-			name: "complex packet with all fields (has payload - OptionalDelay won't round-trip)",
+			name: "complex packet with all fields",
 			packet: &Packet{
 				SendStreamID: 0x12345678,
 				RecvStreamID: 0x9ABCDEF0,
@@ -528,15 +534,11 @@ func TestPacketRoundTrip(t *testing.T) {
 				AckThrough:   0x76543210,
 				Flags:        FlagSYN | FlagACK | FlagFromIncluded,
 				ResendDelay:  1500,
-				// Note: OptionalDelay CANNOT be included with payload due to MVP limitation
-				// The marshal will include it, but unmarshal will treat it as part of payload
-				// OptionalDelay: 2000,  // Skip this to make test pass
-				Payload: []byte("round trip test"),
+				Payload:      []byte("round trip test"),
 			},
-			skipOptDelay: true, // MVP limitation
 		},
 		{
-			name: "large payload (OptionalDelay won't round-trip)",
+			name: "large payload",
 			packet: &Packet{
 				SendStreamID: 1,
 				RecvStreamID: 2,
@@ -545,7 +547,6 @@ func TestPacketRoundTrip(t *testing.T) {
 				Flags:        FlagACK,
 				Payload:      make([]byte, DefaultMTU),
 			},
-			skipOptDelay: true, // MVP limitation
 		},
 	}
 
@@ -567,12 +568,8 @@ func TestPacketRoundTrip(t *testing.T) {
 			assert.Equal(t, tt.packet.AckThrough, roundTrip.AckThrough, "AckThrough")
 			assert.Equal(t, tt.packet.Flags, roundTrip.Flags, "Flags")
 			assert.Equal(t, tt.packet.ResendDelay, roundTrip.ResendDelay, "ResendDelay")
-
-			// OptionalDelay - skip if MVP limitation applies
-			if !tt.skipOptDelay {
-				assert.Equal(t, tt.packet.OptionalDelay, roundTrip.OptionalDelay, "OptionalDelay")
-			}
-
+			assert.Equal(t, tt.packet.OptionalDelay, roundTrip.OptionalDelay, "OptionalDelay")
+			assert.Equal(t, tt.packet.MaxPacketSize, roundTrip.MaxPacketSize, "MaxPacketSize")
 			assert.Equal(t, tt.packet.Payload, roundTrip.Payload, "Payload")
 		})
 	}
@@ -593,29 +590,31 @@ func TestPacketUnmarshalEdgeCases(t *testing.T) {
 			errMsg:  "packet too short",
 		},
 		{
-			name:    "exactly 20 bytes (1 byte short)",
-			data:    make([]byte, 20),
+			name:    "exactly 22 bytes (1 byte short)",
+			data:    make([]byte, 22),
 			wantErr: true,
 			errMsg:  "packet too short",
 		},
 		{
-			name: "exactly 21 bytes (minimal valid)",
+			name: "exactly 23 bytes (minimal valid)",
 			data: func() []byte {
-				buf := make([]byte, 21)
+				buf := make([]byte, 23)
 				binary.BigEndian.PutUint16(buf[19:], FlagSYN)
+				binary.BigEndian.PutUint16(buf[21:], 0) // Option Size
 				return buf
 			}(),
 			wantErr: false,
 		},
 		{
-			name: "22 bytes (could be 21 + 1 byte payload OR optional delay with incomplete second byte)",
+			name: "24 bytes (23 + 1 byte payload)",
 			data: func() []byte {
-				buf := make([]byte, 22)
+				buf := make([]byte, 24)
 				binary.BigEndian.PutUint16(buf[19:], FlagACK)
-				buf[21] = 0 // First byte of potential OptionalDelay (value would be 0)
+				binary.BigEndian.PutUint16(buf[21:], 0) // Option Size
+				buf[23] = 0x42                          // 1 byte payload
 				return buf
 			}(),
-			wantErr: false, // Should parse as payload since OptionalDelay would be 0
+			wantErr: false,
 		},
 	}
 

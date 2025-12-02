@@ -321,18 +321,19 @@ func DialWithMTU(session *go_i2cp.Session, dest *go_i2cp.Destination, localPort,
 }
 
 // sendSYN sends a SYN packet to initiate the handshake.
-// Includes our MTU in the payload for negotiation.
+// Includes our MTU in the MAX_PACKET_SIZE_INCLUDED option for negotiation.
 func (s *StreamConn) sendSYN() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	pkt := &Packet{
-		SendStreamID: uint32(s.localPort),
-		RecvStreamID: uint32(s.remotePort),
-		SequenceNum:  s.sendSeq,
-		AckThrough:   0, // No ACK yet
-		Flags:        FlagSYN,
-		// Payload could contain MTU info or initial data
+		SendStreamID:  uint32(s.localPort),
+		RecvStreamID:  uint32(s.remotePort),
+		SequenceNum:   s.sendSeq,
+		AckThrough:    0, // No ACK yet
+		Flags:         FlagSYN | FlagMaxPacketSizeIncluded,
+		MaxPacketSize: s.localMTU, // Advertise our MTU
+		// Payload could contain initial data (allowed per spec)
 		// For MVP, keep it simple - no initial data in SYN
 	}
 
@@ -350,6 +351,7 @@ func (s *StreamConn) sendSYN() error {
 	log.Debug().
 		Uint32("seq", pkt.SequenceNum).
 		Uint16("flags", pkt.Flags).
+		Uint16("localMTU", s.localMTU).
 		Uint16("localPort", s.localPort).
 		Uint16("remotePort", s.remotePort).
 		Msg("sent SYN")
@@ -621,6 +623,18 @@ func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16) er
 		return fmt.Errorf("generate ISN: %w", err)
 	}
 
+	// Extract remote MTU from SYN packet if present
+	var remoteMTU uint16 = DefaultMTU
+	if synPkt.Flags&FlagMaxPacketSizeIncluded != 0 && synPkt.MaxPacketSize > 0 {
+		remoteMTU = synPkt.MaxPacketSize
+		log.Debug().
+			Uint16("remoteMTU", remoteMTU).
+			Uint16("localMTU", l.localMTU).
+			Msg("extracted MTU from SYN")
+	} else {
+		log.Warn().Msg("SYN missing MTU, using default")
+	}
+
 	// Create receive buffer
 	recvBuf, err := circbuf.NewBuffer(64 * 1024)
 	if err != nil {
@@ -649,7 +663,7 @@ func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16) er
 		cancel:     cancel,
 		state:      StateInit,
 		localMTU:   l.localMTU,
-		remoteMTU:  0, // Will be extracted from SYN if present
+		remoteMTU:  remoteMTU, // Extracted from SYN packet
 	}
 	conn.recvCond = sync.NewCond(&conn.mu)
 
@@ -689,17 +703,18 @@ func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16) er
 }
 
 // sendSynAck sends a SYN-ACK packet in response to a SYN.
-// Includes our MTU for negotiation.
+// Includes our MTU in the MAX_PACKET_SIZE_INCLUDED option for negotiation.
 func (s *StreamConn) sendSynAck() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	pkt := &Packet{
-		SendStreamID: uint32(s.localPort),
-		RecvStreamID: uint32(s.remotePort),
-		SequenceNum:  s.sendSeq,
-		AckThrough:   s.recvSeq - 1, // ACK the SYN
-		Flags:        FlagSYN | FlagACK,
+		SendStreamID:  uint32(s.localPort),
+		RecvStreamID:  uint32(s.remotePort),
+		SequenceNum:   s.sendSeq,
+		AckThrough:    s.recvSeq - 1, // ACK the SYN
+		Flags:         FlagSYN | FlagACK | FlagMaxPacketSizeIncluded,
+		MaxPacketSize: s.localMTU, // Advertise our MTU
 	}
 
 	data, err := pkt.Marshal()
@@ -717,6 +732,7 @@ func (s *StreamConn) sendSynAck() error {
 		Uint32("seq", pkt.SequenceNum).
 		Uint32("ack", pkt.AckThrough).
 		Uint16("flags", pkt.Flags).
+		Uint16("localMTU", s.localMTU).
 		Msg("sent SYN-ACK")
 
 	return nil
@@ -989,7 +1005,19 @@ func (s *StreamConn) handleSynAckLocked(pkt *Packet) error {
 
 	// Extract remote ISN and MTU
 	s.recvSeq = pkt.SequenceNum + 1 // Next expected sequence
-	s.remoteMTU = DefaultMTU        // TODO: Extract from packet
+
+	// Extract MTU from packet if present (FlagMaxPacketSizeIncluded)
+	if pkt.Flags&FlagMaxPacketSizeIncluded != 0 && pkt.MaxPacketSize > 0 {
+		s.remoteMTU = pkt.MaxPacketSize
+		log.Debug().
+			Uint16("remoteMTU", s.remoteMTU).
+			Uint16("localMTU", s.localMTU).
+			Uint16("negotiatedMTU", s.getNegotiatedMTULocked()).
+			Msg("MTU negotiated")
+	} else {
+		s.remoteMTU = DefaultMTU
+		log.Warn().Msg("SYN-ACK missing MTU, using default")
+	}
 
 	// Send final ACK
 	if err := s.sendAckLocked(); err != nil {

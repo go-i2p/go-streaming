@@ -27,6 +27,10 @@ const (
 	FlagSignatureIncluded uint16 = 1 << 6
 	// FlagFromIncluded indicates from field is present
 	FlagFromIncluded uint16 = 1 << 7
+	// FlagDelayRequested indicates optional delay field is present (bit 6)
+	FlagDelayRequested uint16 = 1 << 8
+	// FlagMaxPacketSizeIncluded indicates MTU is present (bit 7)
+	FlagMaxPacketSizeIncluded uint16 = 1 << 9
 )
 
 // Packet represents an I2P streaming protocol packet.
@@ -47,6 +51,7 @@ type Packet struct {
 	// Optional fields (presence indicated by flags or special values)
 	OptionalDelay uint16 // Optional delay in ms (0-60000 = delay, >60000 = choked)
 	ResendDelay   uint16 // Resend delay hint
+	MaxPacketSize uint16 // MTU - maximum payload size in bytes (sent with SYN)
 
 	// Payload
 	Payload []byte
@@ -60,18 +65,30 @@ type Packet struct {
 //   - SequenceNum: 4 bytes
 //   - AckThrough: 4 bytes
 //   - NACKCount: 1 byte (not implemented in MVP - always 0)
-//   - ResendDelay: 2 bytes (optional, included if non-zero)
+//   - ResendDelay: 2 bytes
 //   - Flags: 2 bytes
-//   - OptionalDelay: 2 bytes (optional, included if > 0)
+//   - Option Size: 2 bytes (length of option data)
+//   - Option Data: variable length (determined by flags)
+//   - OptionalDelay: 2 bytes (if FlagDelayRequested is set)
+//   - MaxPacketSize: 2 bytes (if FlagMaxPacketSizeIncluded is set)
 //   - Payload: variable length
 //
 // This is a simplified implementation for MVP. Full spec includes:
 //   - NACK ranges (for selective acknowledgment)
-//   - Signature (for ECHO packets)
-//   - From field (for ECHO packets)
+//   - Signature (for SIGNATURE_INCLUDED flag)
+//   - From field (for FROM_INCLUDED flag)
 func (p *Packet) Marshal() ([]byte, error) {
-	// Estimate buffer size: header (22 bytes min) + payload
-	buf := make([]byte, 0, 22+len(p.Payload))
+	// Calculate option data size based on flags
+	optionSize := uint16(0)
+	if p.Flags&FlagDelayRequested != 0 {
+		optionSize += 2 // OptionalDelay
+	}
+	if p.Flags&FlagMaxPacketSizeIncluded != 0 {
+		optionSize += 2 // MaxPacketSize
+	}
+
+	// Estimate buffer size: header (23 bytes) + options + payload
+	buf := make([]byte, 0, 23+int(optionSize)+len(p.Payload))
 
 	// Required fields (18 bytes)
 	var tmp [4]byte
@@ -87,7 +104,7 @@ func (p *Packet) Marshal() ([]byte, error) {
 	// NACKCount (1 byte) - always 0 for MVP
 	buf = append(buf, 0)
 
-	// ResendDelay (2 bytes) - included if non-zero
+	// ResendDelay (2 bytes)
 	var tmp2 [2]byte
 	binary.BigEndian.PutUint16(tmp2[:], p.ResendDelay)
 	buf = append(buf, tmp2[:]...)
@@ -96,10 +113,18 @@ func (p *Packet) Marshal() ([]byte, error) {
 	binary.BigEndian.PutUint16(tmp2[:], p.Flags)
 	buf = append(buf, tmp2[:]...)
 
-	// OptionalDelay (2 bytes) - included if > 0
-	// Per spec: 0-60000 = advisory delay in ms, >60000 = choked
-	if p.OptionalDelay > 0 {
+	// Option Size (2 bytes)
+	binary.BigEndian.PutUint16(tmp2[:], optionSize)
+	buf = append(buf, tmp2[:]...)
+
+	// Option Data (variable length, determined by flags)
+	// Order matters per spec: DELAY_REQUESTED (bit 6), MAX_PACKET_SIZE_INCLUDED (bit 7)
+	if p.Flags&FlagDelayRequested != 0 {
 		binary.BigEndian.PutUint16(tmp2[:], p.OptionalDelay)
+		buf = append(buf, tmp2[:]...)
+	}
+	if p.Flags&FlagMaxPacketSizeIncluded != 0 {
+		binary.BigEndian.PutUint16(tmp2[:], p.MaxPacketSize)
 		buf = append(buf, tmp2[:]...)
 	}
 
@@ -153,9 +178,9 @@ func (p *Packet) Marshal() ([]byte, error) {
 //
 // Returns an error if the data is too short or malformed.
 func (p *Packet) Unmarshal(data []byte) error {
-	// Minimum packet size: 21 bytes (18 required + 1 NACKCount + 2 ResendDelay + 2 Flags)
-	if len(data) < 21 {
-		return fmt.Errorf("packet too short: got %d bytes, need at least 21", len(data))
+	// Minimum packet size: 23 bytes (18 required + 1 NACKCount + 2 ResendDelay + 2 Flags + 2 OptionSize)
+	if len(data) < 23 {
+		return fmt.Errorf("packet too short: got %d bytes, need at least 23", len(data))
 	}
 
 	offset := 0
@@ -186,21 +211,38 @@ func (p *Packet) Unmarshal(data []byte) error {
 	p.Flags = binary.BigEndian.Uint16(data[offset:])
 	offset += 2
 
-	// OptionalDelay parsing (MVP limitation - see function comment)
-	// For packets with ONLY OptionalDelay (no payload), we can detect it
-	// For packets with both OptionalDelay and payload, we cannot reliably distinguish
-	//
-	// Rule: If exactly 2 bytes remain, treat as OptionalDelay IF value looks reasonable
-	// (in valid range 1-65535). Otherwise, treat all remaining bytes as payload.
-	remaining := len(data) - offset
-	if remaining == 2 {
-		// Exactly 2 bytes - could be OptionalDelay without payload
-		// Read it as OptionalDelay
+	// Option Size (2 bytes)
+	optionSize := binary.BigEndian.Uint16(data[offset:])
+	offset += 2
+
+	// Validate we have enough data for options
+	if len(data) < offset+int(optionSize) {
+		return fmt.Errorf("packet too short for options: got %d bytes, need %d", len(data), offset+int(optionSize))
+	}
+
+	// Parse option data based on flags
+	// Order matters per spec: DELAY_REQUESTED (bit 6), MAX_PACKET_SIZE_INCLUDED (bit 7)
+	optionsEnd := offset + int(optionSize)
+	if p.Flags&FlagDelayRequested != 0 {
+		if offset+2 > optionsEnd {
+			return fmt.Errorf("option data too short for OptionalDelay")
+		}
 		p.OptionalDelay = binary.BigEndian.Uint16(data[offset:])
 		offset += 2
-	} else if remaining > 2 {
-		// More than 2 bytes - treat all as payload (cannot detect OptionalDelay reliably)
-		// This is the MVP limitation documented above
+	}
+	if p.Flags&FlagMaxPacketSizeIncluded != 0 {
+		if offset+2 > optionsEnd {
+			return fmt.Errorf("option data too short for MaxPacketSize")
+		}
+		p.MaxPacketSize = binary.BigEndian.Uint16(data[offset:])
+		offset += 2
+	}
+
+	// Skip any unrecognized option data
+	offset = optionsEnd
+
+	// Payload is everything remaining
+	if offset < len(data) {
 		p.Payload = data[offset:]
 	}
 
