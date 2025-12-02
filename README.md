@@ -79,7 +79,7 @@ This library is under active development. **Phase 6 (Integration Testing)** is c
 
 ### Recently Completed (Phase 6)
 
-- ✅ **Integration Test Suite** - 151 tests with 67.8% coverage, race-free
+- ✅ **Integration Test Suite** - 172 tests with 68.0% coverage, race-free
 - ✅ **SessionCallbacks Integration** - Full callback-driven packet reception
 - ✅ **StreamManager** - Routes packets from I2CP callbacks to connections
 - ✅ **Connection Multiplexing** - Multiple connections per I2CP session tested
@@ -98,7 +98,7 @@ This library is under active development. **Phase 6 (Integration Testing)** is c
 - ✅ Echo server/client examples
 - ✅ **Callback-based packet reception** via StreamManager
 - ✅ **Connection multiplexing** - Multiple streams per session
-- ✅ **Integration tested** - 151 tests, 67.8% coverage, race-free
+- ✅ **Integration tested** - 172 tests, 68.0% coverage, race-free
 - ✅ **Large transfers** - Validated 100KB+ with MTU chunking
 - ⚠️  Simplified retransmission (fixed timeout)
 - ⚠️  No congestion control (future)
@@ -206,6 +206,44 @@ func main() {
 
 **See [QUICKREF.md](QUICKREF.md) for a one-page reference guide!**
 
+## Testing
+
+### Unit Tests (No I2P Router Required)
+
+Run the full test suite without needing an I2P router:
+
+```bash
+# Run all unit tests
+go test -v ./...
+
+# With race detector
+go test -race -v ./...
+
+# With coverage
+go test -cover ./...
+```
+
+**Current Status**: 172 tests, 68.0% coverage, race-free
+
+### System Integration Tests (Requires I2P Router)
+
+Test against a real I2P router on localhost:7654:
+
+```bash
+# Run system tests (requires running I2P router)
+go test -tags=system -v -timeout=5m
+
+# Tests auto-skip if router unavailable
+```
+
+System tests verify:
+- Real I2CP connections and session creation
+- Actual data transfer over I2P tunnels  
+- Client-server communication end-to-end
+- Connection multiplexing with real routing
+
+**See [SYSTEM_TESTS.md](SYSTEM_TESTS.md) for detailed instructions.**
+
 ## Known Limitations
 
 This is an **MVP (Minimum Viable Product)** implementation focused on correctness over performance. The following features are not yet implemented:
@@ -234,7 +272,7 @@ This is an **MVP (Minimum Viable Product)** implementation focused on correctnes
 
 ### Production Readiness
 
-- **Limited testing**: 67.8% test coverage. Integration tests pass, but real-world edge cases not fully explored.
+- **Limited testing**: 68.0% test coverage. Integration tests pass, but real-world edge cases not fully explored.
 - **No metrics/monitoring**: No built-in observability (Prometheus, etc.).
 - **No connection pooling**: Each connection requires separate handshake.
 - **IPv6/ECIES optimization**: ECIES MTU (1812) supported but not extensively tested.
@@ -245,6 +283,7 @@ This is an **MVP (Minimum Viable Product)** implementation focused on correctnes
 
 - **[QUICKREF.md](QUICKREF.md)** - One-page quick reference for SessionCallbacks integration ⭐
 - **[INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md)** - Complete integration guide with patterns and examples ⭐
+- **[SYSTEM_TESTS.md](SYSTEM_TESTS.md)** - System integration tests with real I2P router ⭐
 - [SESSIONCALLBACKS_INTEGRATION.md](SESSIONCALLBACKS_INTEGRATION.md) - Phase 3 implementation details
 - [SPEC.md](SPEC.md) - Full I2P streaming protocol specification
 - [ROADMAP.md](ROADMAP.md) - MVP implementation plan with phases
