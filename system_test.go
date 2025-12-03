@@ -181,18 +181,20 @@ func TestSystem_BasicConnectivity(t *testing.T) {
 	}
 	defer client.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), getTestTimeout())
-	defer cancel()
-
-	// Start ProcessIO BEFORE creating session - required for I2CP callbacks
-	startProcessIO(t, client, ctx)
-
-	// Create manager and start session
+	// Create manager and start session WITHOUT ProcessIO running first
+	// NOTE: This seems wrong per I2CP protocol, but matches working example pattern
+	// See GO-I2CP-BUG-REPORT.md for details on go-i2cp issues
 	manager := createTestManager(t, client)
 	if manager == nil {
 		return // Skipped
 	}
 	defer manager.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), getTestTimeout())
+	defer cancel()
+
+	// Start ProcessIO AFTER session is created (workaround for go-i2cp bug)
+	startProcessIO(t, client, ctx)
 
 	// Verify session is active
 	session := manager.Session()
