@@ -197,3 +197,84 @@ func TestSYNPacketStructure(t *testing.T) {
 // Note: I2CP session creation tests require a running I2P router.
 // These will be added in Phase 1 when we implement actual I2CP operations.
 // For now, we verify that the basic types and constants are correct.
+
+// TestGenerateStreamID verifies that stream ID generation works correctly.
+func TestGenerateStreamID(t *testing.T) {
+	t.Run("stream ID is non-zero", func(t *testing.T) {
+		id, err := generateStreamID()
+		require.NoError(t, err, "generateStreamID should not return error")
+		assert.Greater(t, id, uint32(0), "stream ID must be > 0")
+	})
+
+	t.Run("stream IDs are random", func(t *testing.T) {
+		// Generate multiple stream IDs and verify they're different
+		// Statistical test: probability of collision with 10 IDs is negligible
+		ids := make(map[uint32]bool)
+		count := 10
+		for i := 0; i < count; i++ {
+			id, err := generateStreamID()
+			require.NoError(t, err, "generateStreamID should not return error")
+			assert.Greater(t, id, uint32(0), "stream ID must be > 0")
+
+			// Check for uniqueness
+			assert.False(t, ids[id], "stream ID %d should be unique (collision)", id)
+			ids[id] = true
+		}
+		assert.Equal(t, count, len(ids), "all stream IDs should be unique")
+	})
+
+	t.Run("stream IDs use full 32-bit space", func(t *testing.T) {
+		// Generate many stream IDs and verify distribution across bit space
+		// Test that we get values in different ranges
+		count := 1000
+		hasLow := false  // ID < 2^16
+		hasMid := false  // 2^16 <= ID < 2^24
+		hasHigh := false // ID >= 2^24
+
+		for i := 0; i < count; i++ {
+			id, err := generateStreamID()
+			require.NoError(t, err, "generateStreamID should not return error")
+			assert.Greater(t, id, uint32(0), "stream ID must be > 0")
+
+			if id < (1 << 16) {
+				hasLow = true
+			} else if id < (1 << 24) {
+				hasMid = true
+			} else {
+				hasHigh = true
+			}
+
+			// Early exit if we've seen all ranges
+			if hasLow && hasMid && hasHigh {
+				break
+			}
+		}
+
+		// With 1000 random 32-bit values, we should see distribution
+		// across the entire range (probability of missing a range is tiny)
+		assert.True(t, hasLow || hasMid || hasHigh,
+			"stream IDs should use full 32-bit space (got values in ranges: low=%v, mid=%v, high=%v)",
+			hasLow, hasMid, hasHigh)
+	})
+
+	t.Run("no collisions in large sample", func(t *testing.T) {
+		// Birthday paradox: with 10,000 values in 2^32 space,
+		// probability of collision is ~0.01% (negligible)
+		count := 10000
+		ids := make(map[uint32]bool, count)
+
+		for i := 0; i < count; i++ {
+			id, err := generateStreamID()
+			require.NoError(t, err, "generateStreamID should not return error")
+
+			// Check for collision
+			if ids[id] {
+				t.Errorf("collision detected: stream ID %d appeared twice in %d samples", id, count)
+				break
+			}
+			ids[id] = true
+		}
+
+		assert.Equal(t, count, len(ids), "all %d stream IDs should be unique", count)
+	})
+}

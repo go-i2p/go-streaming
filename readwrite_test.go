@@ -23,7 +23,10 @@ func TestWrite_SinglePacket(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Equal(t, len(data), n)
-	assert.Equal(t, uint32(len(data)), conn.sendSeq-generateTestISN())
+	// Sequence number should increment by 1 (one packet sent)
+	assert.Equal(t, uint32(1), conn.sendSeq-generateTestISN())
+	// Byte tracking should match data length
+	assert.Equal(t, uint64(len(data)), conn.totalBytesSent)
 }
 
 // TestWrite_MultiplePackets tests writing data that requires chunking
@@ -39,8 +42,10 @@ func TestWrite_MultiplePackets(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Equal(t, len(data), n)
-	// Sequence number should advance by total bytes written
-	assert.Equal(t, uint32(len(data)), conn.sendSeq-generateTestISN())
+	// Sequence number should increment by 3 (three packets sent: mtu, mtu, 100)
+	assert.Equal(t, uint32(3), conn.sendSeq-generateTestISN())
+	// Byte tracking should match data length
+	assert.Equal(t, uint64(len(data)), conn.totalBytesSent)
 }
 
 // TestWrite_EmptyData tests writing empty data
@@ -185,10 +190,14 @@ func TestHandleIncomingPacket_ValidSequence(t *testing.T) {
 	conn.mu.Lock()
 	data := conn.recvBuf.Bytes()
 	recvSeq := conn.recvSeq
+	totalBytesReceived := conn.totalBytesReceived
 	conn.mu.Unlock()
 
 	assert.Equal(t, "test data", string(data))
-	assert.Equal(t, expectedSeq+uint32(len(pkt.Payload)), recvSeq)
+	// Sequence number should increment by 1 (one packet received)
+	assert.Equal(t, expectedSeq+1, recvSeq)
+	// Byte tracking should match payload length
+	assert.Equal(t, uint64(len(pkt.Payload)), totalBytesReceived)
 }
 
 // TestHandleIncomingPacket_InvalidSequence tests dropping out-of-order packets

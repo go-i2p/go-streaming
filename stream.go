@@ -134,10 +134,18 @@ type StreamConn struct {
 	localPort  uint16
 	remotePort uint16
 
+	// Stream IDs per I2P streaming spec (random, non-zero)
+	localStreamID  uint32 // Our random stream ID
+	remoteStreamID uint32 // Peer's stream ID (extracted from SYN-ACK)
+
 	// Sequence tracking per I2P streaming spec
-	sendSeq    uint32 // Our current sequence number
-	recvSeq    uint32 // Expected remote sequence number
+	sendSeq    uint32 // Our current sequence number (increments by 1 per packet)
+	recvSeq    uint32 // Expected remote sequence number (increments by 1 per packet)
 	ackThrough uint32 // Highest packet number acked by remote
+
+	// Byte tracking (separate from sequence numbers per I2P spec)
+	totalBytesSent     uint64 // Total bytes sent (for statistics)
+	totalBytesReceived uint64 // Total bytes received (for statistics)
 
 	// Flow control - packet-based per I2P spec (not byte-based)
 	windowSize uint32        // Current window size in packets (max 128)
@@ -262,6 +270,12 @@ func DialWithMTU(session *go_i2cp.Session, dest *go_i2cp.Destination, localPort,
 		return nil, fmt.Errorf("generate ISN: %w", err)
 	}
 
+	// Generate random stream ID per I2P streaming spec
+	localStreamID, err := generateStreamID()
+	if err != nil {
+		return nil, fmt.Errorf("generate stream ID: %w", err)
+	}
+
 	// Create receive buffer
 	recvBuf, err := circbuf.NewBuffer(64 * 1024) // 64KB receive buffer
 	if err != nil {
@@ -273,23 +287,25 @@ func DialWithMTU(session *go_i2cp.Session, dest *go_i2cp.Destination, localPort,
 
 	// Initialize connection structure
 	conn := &StreamConn{
-		session:    session,
-		dest:       dest,
-		localPort:  localPort,
-		remotePort: remotePort,
-		sendSeq:    isn,
-		recvSeq:    0, // Will be set from SYN-ACK
-		windowSize: DefaultWindowSize,
-		rtt:        8 * time.Second, // Initial RTT estimate
-		rto:        9 * time.Second, // Initial RTO per spec
-		recvBuf:    recvBuf,
-		recvChan:   make(chan *Packet, 32), // Buffer for incoming packets
-		errChan:    make(chan error, 1),
-		ctx:        ctx,
-		cancel:     cancel,
-		state:      StateInit,
-		localMTU:   uint16(mtu),
-		remoteMTU:  0, // Will be negotiated
+		session:        session,
+		dest:           dest,
+		localPort:      localPort,
+		remotePort:     remotePort,
+		localStreamID:  localStreamID,
+		remoteStreamID: 0, // Will be set from SYN-ACK
+		sendSeq:        isn,
+		recvSeq:        0, // Will be set from SYN-ACK
+		windowSize:     DefaultWindowSize,
+		rtt:            8 * time.Second, // Initial RTT estimate
+		rto:            9 * time.Second, // Initial RTO per spec
+		recvBuf:        recvBuf,
+		recvChan:       make(chan *Packet, 32), // Buffer for incoming packets
+		errChan:        make(chan error, 1),
+		ctx:            ctx,
+		cancel:         cancel,
+		state:          StateInit,
+		localMTU:       uint16(mtu),
+		remoteMTU:      0, // Will be negotiated
 	}
 	conn.recvCond = sync.NewCond(&conn.mu)
 
@@ -363,8 +379,8 @@ func (s *StreamConn) sendSYN() error {
 	}
 
 	pkt := &Packet{
-		SendStreamID:    uint32(s.localPort),
-		RecvStreamID:    uint32(s.remotePort),
+		SendStreamID:    0,               // Always 0 in initial SYN per spec
+		RecvStreamID:    s.localStreamID, // Our stream ID for peer to use
 		SequenceNum:     s.sendSeq,
 		AckThrough:      0, // No ACK yet
 		Flags:           FlagSYN | FlagMaxPacketSizeIncluded | FlagSignatureIncluded | FlagFromIncluded,
@@ -399,6 +415,7 @@ func (s *StreamConn) sendSYN() error {
 		Uint32("seq", pkt.SequenceNum).
 		Uint16("flags", pkt.Flags).
 		Uint16("localMTU", s.localMTU).
+		Uint32("localStreamID", s.localStreamID).
 		Uint16("localPort", s.localPort).
 		Uint16("remotePort", s.remotePort).
 		Int("nacks", len(nacks)).
@@ -440,6 +457,10 @@ func (s *StreamConn) processSynAck(pkt *Packet) {
 	// Extract remote ISN
 	s.recvSeq = pkt.SequenceNum + 1 // Next expected sequence
 
+	// Extract remote stream ID from SYN-ACK
+	// In SYN-ACK, SendStreamID is the peer's stream ID
+	s.remoteStreamID = pkt.SendStreamID
+
 	// MTU negotiation: use minimum of local and remote
 	// For MVP, assume remote MTU is in packet metadata or use default
 	s.remoteMTU = DefaultMTU
@@ -447,6 +468,7 @@ func (s *StreamConn) processSynAck(pkt *Packet) {
 	log.Debug().
 		Uint32("remoteSeq", pkt.SequenceNum).
 		Uint32("ourAck", s.recvSeq).
+		Uint32("remoteStreamID", s.remoteStreamID).
 		Uint16("remoteMTU", s.remoteMTU).
 		Msg("processed SYN-ACK")
 }
@@ -457,8 +479,8 @@ func (s *StreamConn) sendACK() error {
 	defer s.mu.Unlock()
 
 	pkt := &Packet{
-		SendStreamID: uint32(s.localPort),
-		RecvStreamID: uint32(s.remotePort),
+		SendStreamID: s.localStreamID,  // Our stream ID
+		RecvStreamID: s.remoteStreamID, // Peer's stream ID
 		SequenceNum:  s.sendSeq,
 		AckThrough:   s.recvSeq - 1, // ACK the SYN-ACK
 		Flags:        FlagACK,
@@ -671,6 +693,16 @@ func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16, re
 		return fmt.Errorf("generate ISN: %w", err)
 	}
 
+	// Generate our stream ID
+	localStreamID, err := generateStreamID()
+	if err != nil {
+		return fmt.Errorf("generate stream ID: %w", err)
+	}
+
+	// Extract remote stream ID from SYN packet
+	// In SYN, RecvStreamID is the peer's stream ID
+	remoteStreamID := synPkt.RecvStreamID
+
 	// Extract remote MTU from SYN packet if present
 	var remoteMTU uint16 = DefaultMTU
 	if synPkt.Flags&FlagMaxPacketSizeIncluded != 0 && synPkt.MaxPacketSize > 0 {
@@ -694,24 +726,26 @@ func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16, re
 
 	// Create connection structure
 	conn := &StreamConn{
-		manager:    l.manager,
-		session:    l.session,
-		dest:       remoteDest,
-		localPort:  l.localPort,
-		remotePort: remotePort,
-		sendSeq:    isn,
-		recvSeq:    synPkt.SequenceNum + 1, // Next expected sequence
-		windowSize: DefaultWindowSize,
-		rtt:        8 * time.Second,
-		rto:        9 * time.Second,
-		recvBuf:    recvBuf,
-		recvChan:   make(chan *Packet, 32),
-		errChan:    make(chan error, 1),
-		ctx:        ctx,
-		cancel:     cancel,
-		state:      StateInit,
-		localMTU:   l.localMTU,
-		remoteMTU:  remoteMTU, // Extracted from SYN packet
+		manager:        l.manager,
+		session:        l.session,
+		dest:           remoteDest,
+		localPort:      l.localPort,
+		remotePort:     remotePort,
+		localStreamID:  localStreamID,
+		remoteStreamID: remoteStreamID,
+		sendSeq:        isn,
+		recvSeq:        synPkt.SequenceNum + 1, // Next expected sequence
+		windowSize:     DefaultWindowSize,
+		rtt:            8 * time.Second,
+		rto:            9 * time.Second,
+		recvBuf:        recvBuf,
+		recvChan:       make(chan *Packet, 32),
+		errChan:        make(chan error, 1),
+		ctx:            ctx,
+		cancel:         cancel,
+		state:          StateInit,
+		localMTU:       l.localMTU,
+		remoteMTU:      remoteMTU, // Extracted from SYN packet
 	}
 	conn.recvCond = sync.NewCond(&conn.mu)
 
@@ -757,8 +791,8 @@ func (s *StreamConn) sendSynAck() error {
 	defer s.mu.Unlock()
 
 	pkt := &Packet{
-		SendStreamID:  uint32(s.localPort),
-		RecvStreamID:  uint32(s.remotePort),
+		SendStreamID:  s.localStreamID,  // Our stream ID
+		RecvStreamID:  s.remoteStreamID, // Peer's stream ID
 		SequenceNum:   s.sendSeq,
 		AckThrough:    s.recvSeq - 1, // ACK the SYN
 		Flags:         FlagSYN | FlagACK | FlagMaxPacketSizeIncluded,
@@ -831,8 +865,8 @@ func (s *StreamConn) Write(data []byte) (int, error) {
 
 		// Create packet with data
 		pkt := &Packet{
-			SendStreamID: uint32(s.localPort),
-			RecvStreamID: uint32(s.remotePort),
+			SendStreamID: s.localStreamID,  // Our stream ID
+			RecvStreamID: s.remoteStreamID, // Peer's stream ID
 			SequenceNum:  s.sendSeq,
 			AckThrough:   s.recvSeq - 1, // Piggyback ACK
 			Flags:        FlagACK,       // Always include ACK flag
@@ -844,8 +878,10 @@ func (s *StreamConn) Write(data []byte) (int, error) {
 			return total - len(data), fmt.Errorf("send packet: %w", err)
 		}
 
-		// Increment sequence number by payload length
-		s.sendSeq += uint32(len(chunk))
+		// Increment sequence number by 1 per packet (not per byte)
+		// Per I2P streaming spec, sequence numbers count packets, not bytes
+		s.sendSeq++
+		s.totalBytesSent += uint64(len(chunk))
 
 		// Move to next chunk
 		data = data[len(chunk):]
@@ -1187,12 +1223,13 @@ func (s *StreamConn) handleDataLocked(pkt *Packet) error {
 
 	log.Debug().
 		Int("bytes", n).
-		Uint32("oldRecvSeq", s.recvSeq).
-		Uint32("newRecvSeq", s.recvSeq+uint32(n)).
+		Uint32("seq", s.recvSeq).
 		Msg("buffered payload")
 
-	// Update receive sequence number
-	s.recvSeq += uint32(n)
+	// Increment sequence number by 1 per packet (not per byte)
+	// Per I2P streaming spec, sequence numbers count packets, not bytes
+	s.recvSeq++
+	s.totalBytesReceived += uint64(n)
 
 	// Update ackThrough if packet has ACK
 	if pkt.Flags&FlagACK != 0 && pkt.AckThrough > s.ackThrough {
@@ -1242,8 +1279,8 @@ func (s *StreamConn) handleIncomingPacket(pkt *Packet) error {
 // Must be called with s.mu held.
 func (s *StreamConn) sendAckLocked() error {
 	pkt := &Packet{
-		SendStreamID:  uint32(s.localPort),
-		RecvStreamID:  uint32(s.remotePort),
+		SendStreamID:  s.localStreamID,  // Our stream ID
+		RecvStreamID:  s.remoteStreamID, // Peer's stream ID
 		SequenceNum:   s.sendSeq,
 		AckThrough:    s.recvSeq - 1,
 		Flags:         FlagACK,
@@ -1344,8 +1381,8 @@ func (s *StreamConn) Close() error {
 // Must be called with s.mu held.
 func (s *StreamConn) sendCloseLocked() error {
 	pkt := &Packet{
-		SendStreamID: uint32(s.localPort),
-		RecvStreamID: uint32(s.remotePort),
+		SendStreamID: s.localStreamID,  // Our stream ID
+		RecvStreamID: s.remoteStreamID, // Peer's stream ID
 		SequenceNum:  s.sendSeq,
 		AckThrough:   s.recvSeq - 1,
 		Flags:        FlagCLOSE,

@@ -426,6 +426,28 @@ func generateISN() (uint32, error) {
 	return binary.BigEndian.Uint32(isn[:]), nil
 }
 
+// generateStreamID generates a random stream ID for connection identification.
+// Per I2P streaming spec, stream IDs must be:
+//   - Random (not sequential or predictable)
+//   - Non-zero (0 is reserved for initial SYN packets)
+//   - Unique per connection (probability of collision is negligible with 32-bit space)
+//
+// Returns a random uint32 > 0.
+func generateStreamID() (uint32, error) {
+	// Loop until we get a non-zero value
+	// Expected iterations: ~1 (probability of 0 is 1/2^32)
+	for {
+		var buf [4]byte
+		if _, err := rand.Read(buf[:]); err != nil {
+			return 0, fmt.Errorf("generate random stream ID: %w", err)
+		}
+		id := binary.BigEndian.Uint32(buf[:])
+		if id > 0 {
+			return id, nil
+		}
+	}
+}
+
 // getSignatureLength returns the signature length in bytes for a given destination's key type.
 //
 // I2P modern streaming protocol uses Ed25519 signatures:
