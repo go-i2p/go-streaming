@@ -687,6 +687,32 @@ func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16, re
 		Uint16("localPort", l.localPort).
 		Msg("received SYN")
 
+	// Verify SYN signature if present
+	if synPkt.Flags&FlagSignatureIncluded != 0 {
+		if err := VerifyPacketSignature(synPkt, nil); err != nil {
+			// Verification not fully implemented yet, log warning but continue
+			log.Debug().Err(err).Msg("SYN signature verification not yet complete")
+		}
+	}
+
+	// Verify replay prevention (destination hash in NACKs)
+	// SYN packets should contain 8 NACKs with SHA-256(our_destination) split into uint32s
+	if len(synPkt.NACKs) == 8 {
+		ourHash, err := hashDestination(l.session.Destination())
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to hash destination for replay prevention check")
+		} else {
+			for i := 0; i < 8; i++ {
+				expected := binary.BigEndian.Uint32(ourHash[i*4 : (i+1)*4])
+				if synPkt.NACKs[i] != expected {
+					log.Warn().Msg("SYN replay prevention check failed - rejecting")
+					return fmt.Errorf("SYN replay prevention check failed")
+				}
+			}
+			log.Debug().Msg("SYN replay prevention check passed")
+		}
+	}
+
 	// Generate our ISN
 	isn, err := generateISN()
 	if err != nil {
@@ -791,12 +817,22 @@ func (s *StreamConn) sendSynAck() error {
 	defer s.mu.Unlock()
 
 	pkt := &Packet{
-		SendStreamID:  s.localStreamID,  // Our stream ID
-		RecvStreamID:  s.remoteStreamID, // Peer's stream ID
-		SequenceNum:   s.sendSeq,
-		AckThrough:    s.recvSeq - 1, // ACK the SYN
-		Flags:         FlagSYN | FlagACK | FlagMaxPacketSizeIncluded,
-		MaxPacketSize: s.localMTU, // Advertise our MTU
+		SendStreamID:    s.localStreamID,  // Our stream ID
+		RecvStreamID:    s.remoteStreamID, // Peer's stream ID
+		SequenceNum:     s.sendSeq,
+		AckThrough:      s.recvSeq - 1, // ACK the SYN
+		Flags:           FlagSYN | FlagACK | FlagMaxPacketSizeIncluded | FlagSignatureIncluded | FlagFromIncluded,
+		MaxPacketSize:   s.localMTU,              // Advertise our MTU
+		FromDestination: s.session.Destination(), // Include our destination
+	}
+
+	// Sign the SYN-ACK packet
+	keyPair, err := s.session.SigningKeyPair()
+	if err != nil {
+		return fmt.Errorf("get signing key pair: %w", err)
+	}
+	if err := SignPacket(pkt, keyPair); err != nil {
+		return fmt.Errorf("sign SYN-ACK: %w", err)
 	}
 
 	data, err := pkt.Marshal()
@@ -1140,6 +1176,14 @@ func (s *StreamConn) handleFinalAckLocked(pkt *Packet) error {
 func (s *StreamConn) handleCloseLocked(pkt *Packet) error {
 	log.Debug().Msg("received CLOSE")
 
+	// Verify CLOSE signature if present
+	if pkt.Flags&FlagSignatureIncluded != 0 {
+		if err := VerifyPacketSignature(pkt, nil); err != nil {
+			// Verification not fully implemented yet, log warning but continue
+			log.Debug().Err(err).Msg("CLOSE signature verification not yet complete")
+		}
+	}
+
 	switch s.state {
 	case StateEstablished:
 		// Peer initiated close - send CLOSE response
@@ -1169,6 +1213,14 @@ func (s *StreamConn) handleCloseLocked(pkt *Packet) error {
 // Must be called with s.mu held.
 func (s *StreamConn) handleResetLocked(pkt *Packet) error {
 	log.Warn().Msg("received RESET - aborting connection")
+
+	// Verify RESET signature if present
+	if pkt.Flags&FlagSignatureIncluded != 0 {
+		if err := VerifyPacketSignature(pkt, nil); err != nil {
+			// Verification not fully implemented yet, log warning but continue
+			log.Debug().Err(err).Msg("RESET signature verification not yet complete")
+		}
+	}
 
 	s.setState(StateClosed)
 	s.closed = true
@@ -1386,6 +1438,22 @@ func (s *StreamConn) sendCloseLocked() error {
 		SequenceNum:  s.sendSeq,
 		AckThrough:   s.recvSeq - 1,
 		Flags:        FlagCLOSE,
+	}
+
+	// Add signature and FROM destination if session is available
+	if s.session != nil {
+		pkt.Flags |= FlagSignatureIncluded | FlagFromIncluded
+		pkt.FromDestination = s.session.Destination()
+
+		// Sign the CLOSE packet
+		keyPair, err := s.session.SigningKeyPair()
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to get signing key pair for CLOSE packet")
+			// Continue anyway - signing is best effort for CLOSE
+		} else if err := SignPacket(pkt, keyPair); err != nil {
+			log.Warn().Err(err).Msg("failed to sign CLOSE packet")
+			// Continue anyway - signing is best effort for CLOSE
+		}
 	}
 
 	return s.sendPacketLocked(pkt)
