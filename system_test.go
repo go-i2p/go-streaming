@@ -114,8 +114,11 @@ func createTestClient(t *testing.T) *go_i2cp.Client {
 
 	t.Log("Successfully connected to I2P router via I2CP")
 	return client
-} // createTestManager creates a StreamManager with active session.
+}
+
+// createTestManager creates a StreamManager with active session.
 // Fails test if I2CP session creation fails (router not fully functional).
+// NOTE: Caller must start ProcessIO BEFORE calling this function!
 func createTestManager(t *testing.T, client *go_i2cp.Client) *StreamManager {
 	manager, err := NewStreamManager(client)
 	require.NoError(t, err, "Failed to create stream manager")
@@ -123,7 +126,7 @@ func createTestManager(t *testing.T, client *go_i2cp.Client) *StreamManager {
 	t.Log("Starting I2CP session...")
 
 	// Use timeout context to avoid hanging if router doesn't respond
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	err = manager.StartSession(ctx)
@@ -175,17 +178,15 @@ func TestSystem_BasicConnectivity(t *testing.T) {
 	client := createTestClient(t)
 	defer client.Close()
 
-	// Create manager and start session WITHOUT ProcessIO running first
-	// NOTE: This seems wrong per I2CP protocol, but matches working example pattern
-	// See GO-I2CP-BUG-REPORT.md for details on go-i2cp issues
-	manager := createTestManager(t, client)
-	defer manager.Close()
-
 	ctx, cancel := context.WithTimeout(context.Background(), getTestTimeout())
 	defer cancel()
 
-	// Start ProcessIO AFTER session is created (workaround for go-i2cp bug)
+	// Start ProcessIO BEFORE creating session (required for I2CP protocol)
 	startProcessIO(t, client, ctx)
+
+	// Create manager and start session
+	manager := createTestManager(t, client)
+	defer manager.Close()
 
 	// Verify session is active
 	session := manager.Session()
@@ -233,14 +234,14 @@ func TestSystem_ListenerCreation(t *testing.T) {
 	client := createTestClient(t)
 	defer client.Close()
 
-	manager := createTestManager(t, client)
-	defer manager.Close()
-
 	ctx, cancel := context.WithTimeout(context.Background(), getTestTimeout())
 	defer cancel()
 
-	// Start ProcessIO for callback handling
+	// Start ProcessIO BEFORE creating session (required for I2CP protocol)
 	startProcessIO(t, client, ctx)
+
+	manager := createTestManager(t, client)
+	defer manager.Close()
 
 	// Create listener
 	listener, err := ListenWithManager(manager, 8080, DefaultMTU)
@@ -262,11 +263,14 @@ func TestSystem_EchoServerClient(t *testing.T) {
 	serverClient := createTestClient(t)
 	defer serverClient.Close()
 
-	serverManager := createTestManager(t, serverClient)
-	defer serverManager.Close()
-
 	serverCtx, serverCancel := context.WithTimeout(context.Background(), getTestTimeout())
 	defer serverCancel()
+
+	// Start ProcessIO BEFORE creating session (required for I2CP protocol)
+	startProcessIO(t, serverClient, serverCtx)
+
+	serverManager := createTestManager(t, serverClient)
+	defer serverManager.Close()
 
 	startProcessIO(t, serverClient, serverCtx)
 
@@ -324,13 +328,14 @@ func TestSystem_EchoServerClient(t *testing.T) {
 	clientClient := createTestClient(t)
 	defer clientClient.Close()
 
-	clientManager := createTestManager(t, clientClient)
-	defer clientManager.Close()
-
 	clientCtx, clientCancel := context.WithTimeout(context.Background(), getTestTimeout())
 	defer clientCancel()
 
+	// Start ProcessIO BEFORE creating session (required for I2CP protocol)
 	startProcessIO(t, clientClient, clientCtx)
+
+	clientManager := createTestManager(t, clientClient)
+	defer clientManager.Close()
 
 	// Give client ProcessIO time to initialize
 	time.Sleep(1 * time.Second)
@@ -386,16 +391,17 @@ func TestSystem_LargeDataTransfer(t *testing.T) {
 	}
 	defer serverClient.Close()
 
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer serverCancel()
+
+	// Start ProcessIO BEFORE creating session (required for I2CP protocol)
+	startProcessIO(t, serverClient, serverCtx)
+
 	serverManager := createTestManager(t, serverClient)
 	if serverManager == nil {
 		return // Skipped
 	}
 	defer serverManager.Close()
-
-	serverCtx, serverCancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer serverCancel()
-
-	startProcessIO(t, serverClient, serverCtx)
 
 	// Create listener
 	listener, err := ListenWithManager(serverManager, 9001, DefaultMTU)
@@ -440,13 +446,15 @@ func TestSystem_LargeDataTransfer(t *testing.T) {
 	clientClient := createTestClient(t)
 	defer clientClient.Close()
 
-	clientManager := createTestManager(t, clientClient)
-	defer clientManager.Close()
-
 	clientCtx, clientCancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer clientCancel()
 
+	// Start ProcessIO BEFORE creating session (required for I2CP protocol)
 	startProcessIO(t, clientClient, clientCtx)
+
+	clientManager := createTestManager(t, clientClient)
+	defer clientManager.Close()
+
 	time.Sleep(1 * time.Second)
 
 	// Connect and transfer
@@ -495,16 +503,17 @@ func TestSystem_ConcurrentConnections(t *testing.T) {
 	}
 	defer serverClient.Close()
 
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer serverCancel()
+
+	// Start ProcessIO BEFORE creating session (required for I2CP protocol)
+	startProcessIO(t, serverClient, serverCtx)
+
 	serverManager := createTestManager(t, serverClient)
 	if serverManager == nil {
 		return // Skipped
 	}
 	defer serverManager.Close()
-
-	serverCtx, serverCancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer serverCancel()
-
-	startProcessIO(t, serverClient, serverCtx)
 
 	listener, err := ListenWithManager(serverManager, 9002, DefaultMTU)
 	require.NoError(t, err)
@@ -543,13 +552,15 @@ func TestSystem_ConcurrentConnections(t *testing.T) {
 	clientClient := createTestClient(t)
 	defer clientClient.Close()
 
-	clientManager := createTestManager(t, clientClient)
-	defer clientManager.Close()
-
 	clientCtx, clientCancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer clientCancel()
 
+	// Start ProcessIO BEFORE creating session (required for I2CP protocol)
 	startProcessIO(t, clientClient, clientCtx)
+
+	clientManager := createTestManager(t, clientClient)
+	defer clientManager.Close()
+
 	time.Sleep(1 * time.Second)
 
 	// Create multiple connections
@@ -597,13 +608,14 @@ func TestSystem_ConnectionTimeout(t *testing.T) {
 	client := createTestClient(t)
 	defer client.Close()
 
-	manager := createTestManager(t, client)
-	defer manager.Close()
-
 	ctx, cancel := context.WithTimeout(context.Background(), getTestTimeout())
 	defer cancel()
 
+	// Start ProcessIO BEFORE creating session (required for I2CP protocol)
 	startProcessIO(t, client, ctx)
+
+	manager := createTestManager(t, client)
+	defer manager.Close()
 
 	// Create a fake destination (won't exist)
 	// Using minimal empty destination for timeout test

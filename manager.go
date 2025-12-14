@@ -55,6 +55,7 @@ type connKey struct {
 // incomingPacket represents a received I2CP message
 type incomingPacket struct {
 	protocol uint8
+	srcDest  *go_i2cp.Destination
 	srcPort  uint16
 	destPort uint16
 	payload  []byte
@@ -189,6 +190,7 @@ func (sm *StreamManager) UnregisterConnection(localPort, remotePort uint16) {
 // Note: This runs in a goroutine spawned by go-i2cp (async by default).
 func (sm *StreamManager) handleIncomingMessage(
 	session *go_i2cp.Session,
+	srcDest *go_i2cp.Destination,
 	protocol uint8,
 	srcPort, destPort uint16,
 	payload *go_i2cp.Stream,
@@ -210,6 +212,7 @@ func (sm *StreamManager) handleIncomingMessage(
 	// Queue for processing by packet dispatcher
 	packet := &incomingPacket{
 		protocol: protocol,
+		srcDest:  srcDest,
 		srcPort:  srcPort,
 		destPort: destPort,
 		payload:  payload.Bytes(),
@@ -359,7 +362,7 @@ func (sm *StreamManager) dispatchPacket(incoming *incomingPacket) {
 		// Look for listener on this port
 		if listenerIface, ok := sm.listeners.Load(incoming.destPort); ok {
 			listener := listenerIface.(*StreamListener)
-			listener.handleIncomingSYN(pkt, incoming.srcPort)
+			listener.handleIncomingSYN(pkt, incoming.srcPort, incoming.srcDest)
 			return
 		}
 

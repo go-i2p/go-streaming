@@ -57,7 +57,7 @@ func TestStreamManager_CallbackRegistration(t *testing.T) {
 
 	// The callback should filter for protocol 6 (streaming)
 	// For testing, we can verify the manager processes the packet
-	manager.handleIncomingMessage(manager.Session(), 6, 1234, 5678, testPayload)
+	manager.handleIncomingMessage(manager.Session(), nil, 6, 1234, 5678, testPayload)
 
 	// Give packet processor time to run
 	time.Sleep(10 * time.Millisecond)
@@ -101,7 +101,7 @@ func TestStreamManager_ListenerRegistration(t *testing.T) {
 
 	// Simulate incoming SYN
 	testPayload := go_i2cp.NewStream(data)
-	manager.handleIncomingMessage(manager.Session(), 6, 1234, testPort, testPayload)
+	manager.handleIncomingMessage(manager.Session(), nil, 6, 1234, testPort, testPayload)
 
 	// Give packet processor time to route the packet
 	time.Sleep(10 * time.Millisecond)
@@ -156,7 +156,7 @@ func TestStreamManager_ConnectionRegistration(t *testing.T) {
 
 	// Simulate incoming data packet
 	testPayload := go_i2cp.NewStream(data)
-	manager.handleIncomingMessage(manager.Session(), 6, remotePort, localPort, testPayload)
+	manager.handleIncomingMessage(manager.Session(), nil, 6, remotePort, localPort, testPayload)
 
 	// Give packet processor time to route
 	time.Sleep(10 * time.Millisecond)
@@ -185,7 +185,7 @@ func TestStreamManager_PacketFiltering(t *testing.T) {
 	testPayload := go_i2cp.NewStream([]byte("non-streaming data"))
 
 	// Send with protocol 0 (repliable datagram) - should be ignored
-	manager.handleIncomingMessage(manager.Session(), 0, 1234, 5678, testPayload)
+	manager.handleIncomingMessage(manager.Session(), nil, 0, 1234, 5678, testPayload)
 
 	// Give processor time (though it should ignore immediately)
 	time.Sleep(10 * time.Millisecond)

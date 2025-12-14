@@ -610,7 +610,7 @@ func (l *StreamListener) Close() error {
 //  7. Queue connection for Accept()
 //
 // The connection will transition to ESTABLISHED when it receives the final ACK.
-func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16) error {
+func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16, remoteDest *go_i2cp.Destination) error {
 	log.Debug().
 		Uint32("remoteSeq", synPkt.SequenceNum).
 		Uint16("remotePort", remotePort).
@@ -648,7 +648,7 @@ func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16) er
 	conn := &StreamConn{
 		manager:    l.manager,
 		session:    l.session,
-		dest:       nil, // TODO: Extract from packet or lease set
+		dest:       remoteDest,
 		localPort:  l.localPort,
 		remotePort: remotePort,
 		sendSeq:    isn,

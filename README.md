@@ -237,6 +237,7 @@ go test -tags=system -v -timeout=5m
 ```
 
 System tests verify:
+
 - Real I2CP connections and session creation
 - Actual data transfer over I2P tunnels  
 - Client-server communication end-to-end
@@ -314,4 +315,3 @@ This project follows the I2P streaming protocol specification closely. Before co
 - [I2P Streaming Library Specification](https://geti2p.net/spec/streaming)
 - [I2CP Protocol](https://geti2p.net/spec/i2cp)
 - [go-i2cp Implementation](https://github.com/go-i2p/go-i2cp)
-
