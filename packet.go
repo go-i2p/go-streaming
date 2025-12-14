@@ -49,9 +49,10 @@ type Packet struct {
 	Flags        uint16 // Packet flags (SYN, ACK, CLOSE, etc.)
 
 	// Optional fields (presence indicated by flags or special values)
-	OptionalDelay uint16 // Optional delay in ms (0-60000 = delay, >60000 = choked)
-	ResendDelay   uint8  // Resend delay hint (changed from uint16 per spec)
-	MaxPacketSize uint16 // MTU - maximum payload size in bytes (sent with SYN)
+	NACKs         []uint32 // Negative acknowledgments for selective ACK or replay prevention (destination hash in SYN)
+	OptionalDelay uint16   // Optional delay in ms (0-60000 = delay, >60000 = choked)
+	ResendDelay   uint8    // Resend delay hint (changed from uint16 per spec)
+	MaxPacketSize uint16   // MTU - maximum payload size in bytes (sent with SYN)
 
 	// Payload
 	Payload []byte
@@ -64,8 +65,9 @@ type Packet struct {
 //   - RecvStreamID: 4 bytes
 //   - SequenceNum: 4 bytes
 //   - AckThrough: 4 bytes
-//   - NACKCount: 1 byte (not implemented in MVP - always 0)
+//   - NACKCount: 1 byte (number of NACKs, 0-255)
 //   - ResendDelay: 1 byte (changed from 2 bytes per spec)
+//   - NACKs: 4 bytes each (NACKCount × 4 bytes total)
 //   - Flags: 2 bytes
 //   - Option Size: 2 bytes (length of option data)
 //   - Option Data: variable length (determined by flags)
@@ -73,8 +75,11 @@ type Packet struct {
 //   - MaxPacketSize: 2 bytes (if FlagMaxPacketSizeIncluded is set)
 //   - Payload: variable length
 //
-// This is a simplified implementation for MVP. Full spec includes:
-//   - NACK ranges (for selective acknowledgment)
+// NACKs field is used for:
+//   - Selective acknowledgment: indicate which packets were not received
+//   - Replay prevention: SYN packets include 8 NACKs containing destination hash
+//
+// This implementation still lacks (to be added in future phases):
 //   - Signature (for SIGNATURE_INCLUDED flag)
 //   - From field (for FROM_INCLUDED flag)
 func (p *Packet) Marshal() ([]byte, error) {
@@ -101,11 +106,21 @@ func (p *Packet) Marshal() ([]byte, error) {
 	binary.BigEndian.PutUint32(tmp[:], p.AckThrough)
 	buf = append(buf, tmp[:]...)
 
-	// NACKCount (1 byte) - always 0 for MVP
-	buf = append(buf, 0)
+	// NACKCount (1 byte) - number of NACKs in the list
+	if len(p.NACKs) > 255 {
+		return nil, fmt.Errorf("too many NACKs: got %d, max 255", len(p.NACKs))
+	}
+	nackCount := byte(len(p.NACKs))
+	buf = append(buf, nackCount)
 
 	// ResendDelay (1 byte) - changed from 2 bytes per spec
 	buf = append(buf, p.ResendDelay)
+
+	// Write NACK data (4 bytes per NACK)
+	for _, nack := range p.NACKs {
+		binary.BigEndian.PutUint32(tmp[:], nack)
+		buf = append(buf, tmp[:]...)
+	}
 
 	// Flags (2 bytes)
 	var tmp2 [2]byte
@@ -136,44 +151,22 @@ func (p *Packet) Marshal() ([]byte, error) {
 // Unmarshal parses bytes into a Packet per I2P streaming protocol format.
 //
 // This is the inverse of Marshal(). It handles variable-length packets with
-// optional fields. The minimum packet size is 21 bytes (header with no optional fields).
+// optional fields and NACKs. The minimum packet size is 22 bytes (header with no optional fields or NACKs).
 //
 // Packet format (all multi-byte integers in big-endian):
 //   - SendStreamID: 4 bytes (required)
 //   - RecvStreamID: 4 bytes (required)
 //   - SequenceNum: 4 bytes (required)
 //   - AckThrough: 4 bytes (required)
-//   - NACKCount: 1 byte (required, but always 0 for MVP)
+//   - NACKCount: 1 byte (required, 0-255)
 //   - ResendDelay: 1 byte (required, changed from 2 bytes per spec)
+//   - NACKs: 4 bytes each (NACKCount × 4 bytes, optional if NACKCount > 0)
 //   - Flags: 2 bytes (required)
-//   - OptionalDelay: 2 bytes (optional - see note below)
-//   - Payload: variable length (everything remaining)
-//
-// **OptionalDelay Detection:**
-// Marshal() only includes OptionalDelay if > 0. On unmarshal, we can't distinguish
-// between a 2-byte OptionalDelay and a 2-byte payload prefix without ambiguity.
-//
-// Solution: Look ahead - if remaining bytes after flags == exactly 2, it could be
-// either OptionalDelay with no payload OR a 2-byte payload. We treat it as payload
-// for simplicity (packets without payload are rare). If > 2 bytes remain, we check
-// if the value could be a valid OptionalDelay (0 < value <= 65535). Since any 2-byte
-// sequence is technically valid, we use a simpler rule:
-//
-// - Marshal always appends OptionalDelay BEFORE payload when OptionalDelay > 0
-// - Therefore, Unmarshal should assume the same order
-// - We can't reliably detect OptionalDelay from payload without a length field
-//
-// **Simplified MVP approach**: Since OptionalDelay is optional and we can't reliably
-// detect it without breaking payload parsing, we'll treat all bytes after flags as
-// payload. This means OptionalDelay won't round-trip correctly for now.
-//
-// TODO: Fix this in Phase 3 by either:
-//  1. Adding a length field to the packet format
-//  2. Using a flag bit to indicate OptionalDelay presence
-//  3. Always including OptionalDelay field (even if 0) in Marshal
-//
-// For MVP: We accept this limitation. Packets marshal/unmarshal their headers correctly,
-// but OptionalDelay field is lost on unmarshal if payload is present.
+//   - Option Size: 2 bytes (required)
+//   - Option Data: variable length (determined by flags and Option Size)
+//   - OptionalDelay: 2 bytes (if FlagDelayRequested is set)
+//   - MaxPacketSize: 2 bytes (if FlagMaxPacketSizeIncluded is set)
+//   - Payload: variable length (everything remaining after options)
 //
 // Returns an error if the data is too short or malformed.
 func (p *Packet) Unmarshal(data []byte) error {
@@ -194,17 +187,28 @@ func (p *Packet) Unmarshal(data []byte) error {
 	p.AckThrough = binary.BigEndian.Uint32(data[offset:])
 	offset += 4
 
-	// NACKCount (1 byte) - skip for MVP, always 0
+	// NACKCount (1 byte) - number of NACKs following
 	nackCount := data[offset]
 	offset++
-	if nackCount != 0 {
-		// For MVP, we don't support NACKs, so error if present
-		return fmt.Errorf("NACK support not implemented (got NACKCount=%d)", nackCount)
-	}
 
 	// ResendDelay (1 byte) - changed from 2 bytes per spec
 	p.ResendDelay = uint8(data[offset])
 	offset++
+
+	// Parse NACKs (4 bytes each)
+	if nackCount > 0 {
+		// Validate we have enough data for all NACKs
+		if len(data) < offset+int(nackCount)*4 {
+			return fmt.Errorf("packet too short for NACKs: got %d bytes, need %d for %d NACKs",
+				len(data)-offset, int(nackCount)*4, nackCount)
+		}
+
+		p.NACKs = make([]uint32, nackCount)
+		for i := 0; i < int(nackCount); i++ {
+			p.NACKs[i] = binary.BigEndian.Uint32(data[offset:])
+			offset += 4
+		}
+	}
 
 	// Flags (2 bytes)
 	p.Flags = binary.BigEndian.Uint16(data[offset:])

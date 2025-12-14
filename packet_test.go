@@ -635,3 +635,395 @@ func TestPacketUnmarshalEdgeCases(t *testing.T) {
 		})
 	}
 }
+
+// TestPacketMarshalWithNACKs verifies that Packet.Marshal() correctly handles NACKs.
+func TestPacketMarshalWithNACKs(t *testing.T) {
+	tests := []struct {
+		name    string
+		packet  *Packet
+		wantLen int
+		check   func(*testing.T, []byte)
+	}{
+		{
+			name: "single NACK",
+			packet: &Packet{
+				SendStreamID: 1,
+				RecvStreamID: 2,
+				SequenceNum:  100,
+				AckThrough:   99,
+				Flags:        FlagACK,
+				NACKs:        []uint32{50},
+			},
+			wantLen: 26, // 22 base + 4 bytes (1 NACK)
+			check: func(t *testing.T, data []byte) {
+				assert.Equal(t, uint8(1), data[16], "NACKCount should be 1")
+				assert.Equal(t, uint32(50), binary.BigEndian.Uint32(data[18:22]), "NACK value")
+				assert.Equal(t, FlagACK, binary.BigEndian.Uint16(data[22:24]), "Flags")
+			},
+		},
+		{
+			name: "three NACKs",
+			packet: &Packet{
+				SendStreamID: 1,
+				RecvStreamID: 2,
+				SequenceNum:  100,
+				AckThrough:   99,
+				Flags:        FlagACK,
+				NACKs:        []uint32{10, 20, 30},
+			},
+			wantLen: 34, // 22 base + 12 bytes (3 NACKs)
+			check: func(t *testing.T, data []byte) {
+				assert.Equal(t, uint8(3), data[16], "NACKCount should be 3")
+				assert.Equal(t, uint32(10), binary.BigEndian.Uint32(data[18:22]), "NACK 0")
+				assert.Equal(t, uint32(20), binary.BigEndian.Uint32(data[22:26]), "NACK 1")
+				assert.Equal(t, uint32(30), binary.BigEndian.Uint32(data[26:30]), "NACK 2")
+				assert.Equal(t, FlagACK, binary.BigEndian.Uint16(data[30:32]), "Flags")
+			},
+		},
+		{
+			name: "SYN with 8 NACKs (destination hash for replay prevention)",
+			packet: &Packet{
+				SendStreamID: 0,
+				RecvStreamID: 12345,
+				SequenceNum:  0,
+				AckThrough:   0,
+				Flags:        FlagSYN,
+				NACKs:        []uint32{0x01020304, 0x05060708, 0x090A0B0C, 0x0D0E0F10, 0x11121314, 0x15161718, 0x191A1B1C, 0x1D1E1F20},
+			},
+			wantLen: 54, // 22 base + 32 bytes (8 NACKs)
+			check: func(t *testing.T, data []byte) {
+				assert.Equal(t, uint8(8), data[16], "NACKCount should be 8 for SYN")
+				// Verify first and last NACK
+				assert.Equal(t, uint32(0x01020304), binary.BigEndian.Uint32(data[18:22]), "First NACK")
+				assert.Equal(t, uint32(0x1D1E1F20), binary.BigEndian.Uint32(data[46:50]), "Last NACK")
+				assert.Equal(t, FlagSYN, binary.BigEndian.Uint16(data[50:52]), "Flags")
+			},
+		},
+		{
+			name: "NACKs with payload",
+			packet: &Packet{
+				SendStreamID: 1,
+				RecvStreamID: 2,
+				SequenceNum:  100,
+				AckThrough:   99,
+				Flags:        FlagACK,
+				NACKs:        []uint32{50, 55},
+				Payload:      []byte("test data"),
+			},
+			wantLen: 39, // 22 base + 8 bytes (2 NACKs) + 9 bytes payload
+			check: func(t *testing.T, data []byte) {
+				assert.Equal(t, uint8(2), data[16], "NACKCount should be 2")
+				assert.Equal(t, []byte("test data"), data[30:], "Payload should be at correct offset")
+			},
+		},
+		{
+			name: "NACKs with optional fields",
+			packet: &Packet{
+				SendStreamID:  1,
+				RecvStreamID:  2,
+				SequenceNum:   100,
+				AckThrough:    99,
+				Flags:         FlagACK | FlagDelayRequested | FlagMaxPacketSizeIncluded,
+				NACKs:         []uint32{50},
+				OptionalDelay: 1000,
+				MaxPacketSize: 1500,
+			},
+			wantLen: 30, // 22 base + 4 bytes (1 NACK) + 4 bytes options
+			check: func(t *testing.T, data []byte) {
+				assert.Equal(t, uint8(1), data[16], "NACKCount should be 1")
+				assert.Equal(t, uint16(4), binary.BigEndian.Uint16(data[24:26]), "Option Size should be 4")
+				assert.Equal(t, uint16(1000), binary.BigEndian.Uint16(data[26:28]), "OptionalDelay")
+				assert.Equal(t, uint16(1500), binary.BigEndian.Uint16(data[28:30]), "MaxPacketSize")
+			},
+		},
+		{
+			name: "no NACKs (zero-length slice)",
+			packet: &Packet{
+				SendStreamID: 1,
+				RecvStreamID: 2,
+				SequenceNum:  100,
+				AckThrough:   99,
+				Flags:        FlagACK,
+				NACKs:        []uint32{},
+			},
+			wantLen: 22, // Same as packet without NACKs field
+			check: func(t *testing.T, data []byte) {
+				assert.Equal(t, uint8(0), data[16], "NACKCount should be 0")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := tt.packet.Marshal()
+			require.NoError(t, err, "Marshal should not fail")
+			assert.Equal(t, tt.wantLen, len(data), "Packet length")
+			if tt.check != nil {
+				tt.check(t, data)
+			}
+		})
+	}
+}
+
+// TestPacketUnmarshalWithNACKs verifies that Packet.Unmarshal() correctly parses NACKs.
+func TestPacketUnmarshalWithNACKs(t *testing.T) {
+	tests := []struct {
+		name    string
+		data    []byte
+		wantErr bool
+		errMsg  string
+		check   func(*testing.T, *Packet)
+	}{
+		{
+			name: "single NACK",
+			data: func() []byte {
+				buf := make([]byte, 26)
+				binary.BigEndian.PutUint32(buf[0:], 1)        // SendStreamID
+				binary.BigEndian.PutUint32(buf[4:], 2)        // RecvStreamID
+				binary.BigEndian.PutUint32(buf[8:], 100)      // SequenceNum
+				binary.BigEndian.PutUint32(buf[12:], 99)      // AckThrough
+				buf[16] = 1                                   // NACKCount
+				buf[17] = 0                                   // ResendDelay
+				binary.BigEndian.PutUint32(buf[18:], 50)      // NACK value
+				binary.BigEndian.PutUint16(buf[22:], FlagACK) // Flags
+				binary.BigEndian.PutUint16(buf[24:], 0)       // Option Size
+				return buf
+			}(),
+			wantErr: false,
+			check: func(t *testing.T, pkt *Packet) {
+				require.NotNil(t, pkt.NACKs, "NACKs should not be nil")
+				assert.Equal(t, 1, len(pkt.NACKs), "Should have 1 NACK")
+				assert.Equal(t, uint32(50), pkt.NACKs[0], "NACK value")
+			},
+		},
+		{
+			name: "three NACKs",
+			data: func() []byte {
+				buf := make([]byte, 34)
+				binary.BigEndian.PutUint32(buf[0:], 1)        // SendStreamID
+				binary.BigEndian.PutUint32(buf[4:], 2)        // RecvStreamID
+				binary.BigEndian.PutUint32(buf[8:], 100)      // SequenceNum
+				binary.BigEndian.PutUint32(buf[12:], 99)      // AckThrough
+				buf[16] = 3                                   // NACKCount
+				buf[17] = 0                                   // ResendDelay
+				binary.BigEndian.PutUint32(buf[18:], 10)      // NACK 0
+				binary.BigEndian.PutUint32(buf[22:], 20)      // NACK 1
+				binary.BigEndian.PutUint32(buf[26:], 30)      // NACK 2
+				binary.BigEndian.PutUint16(buf[30:], FlagACK) // Flags
+				binary.BigEndian.PutUint16(buf[32:], 0)       // Option Size
+				return buf
+			}(),
+			wantErr: false,
+			check: func(t *testing.T, pkt *Packet) {
+				require.NotNil(t, pkt.NACKs, "NACKs should not be nil")
+				assert.Equal(t, 3, len(pkt.NACKs), "Should have 3 NACKs")
+				assert.Equal(t, []uint32{10, 20, 30}, pkt.NACKs, "NACK values")
+			},
+		},
+		{
+			name: "SYN with 8 NACKs (destination hash)",
+			data: func() []byte {
+				buf := make([]byte, 54)
+				binary.BigEndian.PutUint32(buf[0:], 0)     // SendStreamID
+				binary.BigEndian.PutUint32(buf[4:], 12345) // RecvStreamID
+				binary.BigEndian.PutUint32(buf[8:], 0)     // SequenceNum
+				binary.BigEndian.PutUint32(buf[12:], 0)    // AckThrough
+				buf[16] = 8                                // NACKCount
+				buf[17] = 0                                // ResendDelay
+				// 8 NACKs (32 bytes total)
+				for i := 0; i < 8; i++ {
+					binary.BigEndian.PutUint32(buf[18+i*4:], uint32(i+1)*0x11111111)
+				}
+				binary.BigEndian.PutUint16(buf[50:], FlagSYN) // Flags
+				binary.BigEndian.PutUint16(buf[52:], 0)       // Option Size
+				return buf
+			}(),
+			wantErr: false,
+			check: func(t *testing.T, pkt *Packet) {
+				require.NotNil(t, pkt.NACKs, "NACKs should not be nil")
+				assert.Equal(t, 8, len(pkt.NACKs), "Should have 8 NACKs for SYN")
+				assert.Equal(t, uint32(0x11111111), pkt.NACKs[0], "First NACK")
+				assert.Equal(t, uint32(0x88888888), pkt.NACKs[7], "Last NACK")
+			},
+		},
+		{
+			name: "NACKs with payload",
+			data: func() []byte {
+				buf := make([]byte, 35)
+				binary.BigEndian.PutUint32(buf[0:], 1)        // SendStreamID
+				binary.BigEndian.PutUint32(buf[4:], 2)        // RecvStreamID
+				binary.BigEndian.PutUint32(buf[8:], 100)      // SequenceNum
+				binary.BigEndian.PutUint32(buf[12:], 99)      // AckThrough
+				buf[16] = 2                                   // NACKCount
+				buf[17] = 0                                   // ResendDelay
+				binary.BigEndian.PutUint32(buf[18:], 50)      // NACK 0
+				binary.BigEndian.PutUint32(buf[22:], 55)      // NACK 1
+				binary.BigEndian.PutUint16(buf[26:], FlagACK) // Flags
+				binary.BigEndian.PutUint16(buf[28:], 0)       // Option Size
+				copy(buf[30:], []byte("hello"))               // Payload
+				return buf
+			}(),
+			wantErr: false,
+			check: func(t *testing.T, pkt *Packet) {
+				require.NotNil(t, pkt.NACKs, "NACKs should not be nil")
+				assert.Equal(t, 2, len(pkt.NACKs), "Should have 2 NACKs")
+				assert.Equal(t, []byte("hello"), pkt.Payload, "Payload")
+			},
+		},
+		{
+			name: "insufficient data for NACKs",
+			data: func() []byte {
+				buf := make([]byte, 22)
+				binary.BigEndian.PutUint32(buf[0:], 1)        // SendStreamID
+				binary.BigEndian.PutUint32(buf[4:], 2)        // RecvStreamID
+				binary.BigEndian.PutUint32(buf[8:], 100)      // SequenceNum
+				binary.BigEndian.PutUint32(buf[12:], 99)      // AckThrough
+				buf[16] = 2                                   // NACKCount = 2 but no data
+				buf[17] = 0                                   // ResendDelay
+				binary.BigEndian.PutUint16(buf[18:], FlagACK) // Flags (wrong offset but will error before)
+				binary.BigEndian.PutUint16(buf[20:], 0)       // Option Size
+				return buf
+			}(),
+			wantErr: true,
+			errMsg:  "packet too short for NACKs",
+		},
+		{
+			name: "no NACKs (NACKCount = 0)",
+			data: func() []byte {
+				buf := make([]byte, 22)
+				binary.BigEndian.PutUint32(buf[0:], 1)        // SendStreamID
+				binary.BigEndian.PutUint32(buf[4:], 2)        // RecvStreamID
+				binary.BigEndian.PutUint32(buf[8:], 100)      // SequenceNum
+				binary.BigEndian.PutUint32(buf[12:], 99)      // AckThrough
+				buf[16] = 0                                   // NACKCount
+				buf[17] = 0                                   // ResendDelay
+				binary.BigEndian.PutUint16(buf[18:], FlagACK) // Flags
+				binary.BigEndian.PutUint16(buf[20:], 0)       // Option Size
+				return buf
+			}(),
+			wantErr: false,
+			check: func(t *testing.T, pkt *Packet) {
+				assert.Nil(t, pkt.NACKs, "NACKs should be nil when count is 0")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pkt := &Packet{}
+			err := pkt.Unmarshal(tt.data)
+
+			if tt.wantErr {
+				assert.Error(t, err, "Unmarshal should fail")
+				if tt.errMsg != "" {
+					assert.Contains(t, err.Error(), tt.errMsg, "Error message")
+				}
+			} else {
+				require.NoError(t, err, "Unmarshal should not fail")
+				if tt.check != nil {
+					tt.check(t, pkt)
+				}
+			}
+		})
+	}
+}
+
+// TestPacketNACKsRoundTrip verifies that NACKs survive marshal/unmarshal cycle.
+func TestPacketNACKsRoundTrip(t *testing.T) {
+	tests := []struct {
+		name   string
+		packet *Packet
+	}{
+		{
+			name: "single NACK",
+			packet: &Packet{
+				SendStreamID: 1,
+				RecvStreamID: 2,
+				SequenceNum:  100,
+				AckThrough:   99,
+				Flags:        FlagACK,
+				NACKs:        []uint32{50},
+			},
+		},
+		{
+			name: "multiple NACKs",
+			packet: &Packet{
+				SendStreamID: 1,
+				RecvStreamID: 2,
+				SequenceNum:  100,
+				AckThrough:   99,
+				Flags:        FlagACK,
+				NACKs:        []uint32{10, 20, 30, 40, 50},
+			},
+		},
+		{
+			name: "SYN with 8 NACKs",
+			packet: &Packet{
+				SendStreamID: 0,
+				RecvStreamID: 12345,
+				SequenceNum:  0,
+				AckThrough:   0,
+				Flags:        FlagSYN,
+				NACKs:        []uint32{1, 2, 3, 4, 5, 6, 7, 8},
+			},
+		},
+		{
+			name: "NACKs with payload and options",
+			packet: &Packet{
+				SendStreamID:  1,
+				RecvStreamID:  2,
+				SequenceNum:   100,
+				AckThrough:    99,
+				Flags:         FlagACK | FlagMaxPacketSizeIncluded,
+				NACKs:         []uint32{50, 55, 60},
+				MaxPacketSize: 1500,
+				Payload:       []byte("test data"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Marshal
+			data, err := tt.packet.Marshal()
+			require.NoError(t, err, "Marshal should not fail")
+
+			// Unmarshal
+			pkt := &Packet{}
+			err = pkt.Unmarshal(data)
+			require.NoError(t, err, "Unmarshal should not fail")
+
+			// Compare
+			assert.Equal(t, tt.packet.SendStreamID, pkt.SendStreamID, "SendStreamID")
+			assert.Equal(t, tt.packet.RecvStreamID, pkt.RecvStreamID, "RecvStreamID")
+			assert.Equal(t, tt.packet.SequenceNum, pkt.SequenceNum, "SequenceNum")
+			assert.Equal(t, tt.packet.AckThrough, pkt.AckThrough, "AckThrough")
+			assert.Equal(t, tt.packet.Flags, pkt.Flags, "Flags")
+			assert.Equal(t, tt.packet.NACKs, pkt.NACKs, "NACKs")
+			assert.Equal(t, tt.packet.ResendDelay, pkt.ResendDelay, "ResendDelay")
+			assert.Equal(t, tt.packet.MaxPacketSize, pkt.MaxPacketSize, "MaxPacketSize")
+			assert.Equal(t, tt.packet.Payload, pkt.Payload, "Payload")
+		})
+	}
+}
+
+// TestPacketMarshalTooManyNACKs verifies error handling for excessive NACKs.
+func TestPacketMarshalTooManyNACKs(t *testing.T) {
+	nacks := make([]uint32, 256)
+	for i := range nacks {
+		nacks[i] = uint32(i)
+	}
+
+	pkt := &Packet{
+		SendStreamID: 1,
+		RecvStreamID: 2,
+		SequenceNum:  100,
+		AckThrough:   99,
+		Flags:        FlagACK,
+		NACKs:        nacks,
+	}
+
+	_, err := pkt.Marshal()
+	require.Error(t, err, "Marshal should fail with too many NACKs")
+	assert.Contains(t, err.Error(), "too many NACKs", "Error message should mention NACKs limit")
+}
