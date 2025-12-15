@@ -157,6 +157,8 @@ type StreamConn struct {
 
 	// Flow control - packet-based per I2P spec (not byte-based)
 	windowSize uint32        // Current window size in packets (max 128)
+	cwnd       uint32        // Congestion window for slow start / congestion avoidance
+	ssthresh   uint32        // Slow start threshold
 	rtt        time.Duration // Round trip time estimate
 	rto        time.Duration // Retransmission timeout
 
@@ -314,8 +316,10 @@ func DialWithMTU(session *go_i2cp.Session, dest *go_i2cp.Destination, localPort,
 		localStreamID:  localStreamID,
 		remoteStreamID: 0, // Will be set from SYN-ACK
 		sendSeq:        isn,
-		recvSeq:        0, // Will be set from SYN-ACK
-		windowSize:     DefaultWindowSize,
+		recvSeq:        0,               // Will be set from SYN-ACK
+		windowSize:     1,               // Start with slow start at 1 packet
+		cwnd:           1,               // Congestion window starts at 1
+		ssthresh:       MaxWindowSize,   // Slow start threshold at max (128 packets)
 		rtt:            8 * time.Second, // Initial RTT estimate
 		rto:            9 * time.Second, // Initial RTO per spec
 		recvBuf:        recvBuf,
@@ -781,7 +785,9 @@ func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16, re
 		remoteStreamID: remoteStreamID,
 		sendSeq:        isn,
 		recvSeq:        synPkt.SequenceNum + 1, // Next expected sequence
-		windowSize:     DefaultWindowSize,
+		windowSize:     1,                      // Start with slow start at 1 packet
+		cwnd:           1,                      // Congestion window starts at 1
+		ssthresh:       MaxWindowSize,          // Slow start threshold at max (128 packets)
 		rtt:            8 * time.Second,
 		rto:            9 * time.Second,
 		recvBuf:        recvBuf,
@@ -1286,6 +1292,34 @@ func (s *StreamConn) handleAckLocked(pkt *Packet) error {
 		// Clean up ACKed packets from sent packet tracking
 		// Remove all packets with sequence <= ackThrough
 		s.cleanupAckedPacketsLocked(oldAck, pkt.AckThrough)
+
+		// Slow start / congestion avoidance algorithm
+		// Implements TCP-style congestion control for I2P streaming
+		if s.cwnd < s.ssthresh {
+			// Slow start phase: exponential growth
+			// Double cwnd on each ACK until we reach ssthresh
+			oldCwnd := s.cwnd
+			s.cwnd = min(s.cwnd*2, s.ssthresh)
+			s.windowSize = s.cwnd
+
+			log.Debug().
+				Uint32("oldCwnd", oldCwnd).
+				Uint32("newCwnd", s.cwnd).
+				Uint32("ssthresh", s.ssthresh).
+				Msg("slow start: doubled window")
+		} else {
+			// Congestion avoidance phase: linear growth
+			// Increment cwnd by 1 on each ACK
+			oldCwnd := s.cwnd
+			s.cwnd = min(s.cwnd+1, MaxWindowSize)
+			s.windowSize = s.cwnd
+
+			log.Debug().
+				Uint32("oldCwnd", oldCwnd).
+				Uint32("newCwnd", s.cwnd).
+				Uint32("maxWindow", MaxWindowSize).
+				Msg("congestion avoidance: incremented window")
+		}
 	}
 
 	// Process NACKs if present - receiver is requesting retransmission
