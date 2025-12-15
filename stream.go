@@ -114,6 +114,14 @@ func (a *I2PAddr) String() string {
 	return fmt.Sprintf("i2p:%d", a.port)
 }
 
+// sentPacket tracks information about a sent packet for retransmission.
+// Used by sender to handle NACK requests from receiver.
+type sentPacket struct {
+	data       []byte    // Marshaled packet data for retransmission
+	sentTime   time.Time // When packet was originally sent
+	retryCount int       // Number of times packet has been retransmitted
+}
+
 // StreamConn represents a single bidirectional stream over I2CP.
 // Implements net.Conn interface.
 //
@@ -165,6 +173,10 @@ type StreamConn struct {
 	// Tracks packets received out of sequence to enable retransmission requests
 	outOfOrderPackets map[uint32]*Packet // Buffered packets received out of order
 	nackList          []uint32           // Sequence numbers we haven't received yet (for NACK field)
+
+	// Sent packet tracking for retransmission on NACK reception
+	// Maps sequence number to sent packet info for unacknowledged packets
+	sentPackets map[uint32]*sentPacket // Packets we've sent but not yet ACKed
 
 	// Simple byte buffers for MVP
 	// Using github.com/armon/circbuf for receive buffer to avoid wraparound bugs
@@ -1239,10 +1251,32 @@ func (s *StreamConn) handleResetLocked(pkt *Packet) error {
 func (s *StreamConn) handleAckLocked(pkt *Packet) error {
 	// Update ackThrough if this ACKs more data
 	if pkt.AckThrough > s.ackThrough {
+		oldAck := s.ackThrough
 		s.ackThrough = pkt.AckThrough
 		log.Debug().
 			Uint32("ackThrough", s.ackThrough).
 			Msg("updated ackThrough")
+
+		// Clean up ACKed packets from sent packet tracking
+		// Remove all packets with sequence <= ackThrough
+		s.cleanupAckedPacketsLocked(oldAck, pkt.AckThrough)
+	}
+
+	// Process NACKs if present - receiver is requesting retransmission
+	if len(pkt.NACKs) > 0 {
+		log.Debug().
+			Int("nackCount", len(pkt.NACKs)).
+			Msg("processing NACK requests")
+
+		for _, nackSeq := range pkt.NACKs {
+			if err := s.retransmitPacketLocked(nackSeq); err != nil {
+				log.Warn().
+					Err(err).
+					Uint32("seq", nackSeq).
+					Msg("retransmission failed")
+				// Continue with other NACKs even if one fails
+			}
+		}
 	}
 
 	// Handle optional delay (choking mechanism)
@@ -1427,6 +1461,61 @@ func (s *StreamConn) removeFromNACKListLocked(seq uint32) {
 	}
 }
 
+// cleanupAckedPacketsLocked removes ACKed packets from the sent packet tracking.
+// This prevents unbounded memory growth by cleaning up packets that have been acknowledged.
+// Must be called with s.mu held.
+func (s *StreamConn) cleanupAckedPacketsLocked(oldAck, newAck uint32) {
+	if s.sentPackets == nil {
+		return
+	}
+	cleaned := 0
+	for seq := range s.sentPackets {
+		if seq <= newAck {
+			delete(s.sentPackets, seq)
+			cleaned++
+		}
+	}
+	if cleaned > 0 {
+		log.Debug().
+			Uint32("oldAck", oldAck).
+			Uint32("newAck", newAck).
+			Int("cleaned", cleaned).
+			Int("remaining", len(s.sentPackets)).
+			Msg("cleaned up ACKed packets")
+	}
+}
+
+// retransmitPacketLocked retransmits a packet in response to a NACK.
+// It looks up the packet data from sentPackets and resends it via the I2CP session.
+// Must be called with s.mu held.
+func (s *StreamConn) retransmitPacketLocked(seq uint32) error {
+	info, exists := s.sentPackets[seq]
+	if !exists {
+		// Packet was already ACKed and cleaned up, nothing to retransmit
+		log.Debug().Uint32("seq", seq).Msg("packet already ACKed, skipping retransmit")
+		return nil
+	}
+
+	// Resend the marshaled packet data via I2CP
+	if s.session != nil {
+		stream := go_i2cp.NewStream(info.data)
+		if err := s.session.SendMessage(s.dest, 6, s.localPort, s.remotePort, stream, 0); err != nil {
+			return fmt.Errorf("retransmit seq %d: %w", seq, err)
+		}
+	}
+
+	// Update retry tracking
+	info.retryCount++
+	info.sentTime = time.Now()
+
+	log.Debug().
+		Uint32("seq", seq).
+		Int("retryCount", info.retryCount).
+		Msg("retransmitted packet")
+
+	return nil
+}
+
 // handleIncomingPacket is called by the StreamManager when a packet arrives for this connection.
 // It queues the packet for processing by the receiveLoop.
 //
@@ -1490,6 +1579,24 @@ func (s *StreamConn) sendPacketLocked(pkt *Packet) error {
 	data, err := pkt.Marshal()
 	if err != nil {
 		return fmt.Errorf("marshal packet: %w", err)
+	}
+
+	// Track data packets for potential retransmission on NACK
+	// Only track packets with payload (data packets), not control packets
+	if len(pkt.Payload) > 0 {
+		if s.sentPackets == nil {
+			s.sentPackets = make(map[uint32]*sentPacket)
+		}
+		s.sentPackets[pkt.SequenceNum] = &sentPacket{
+			data:       data,
+			sentTime:   time.Now(),
+			retryCount: 0,
+		}
+
+		log.Debug().
+			Uint32("seq", pkt.SequenceNum).
+			Int("tracked", len(s.sentPackets)).
+			Msg("tracking sent packet for retransmission")
 	}
 
 	// MVP: Skip actual I2CP sending if session is nil (for testing)
