@@ -441,16 +441,9 @@ func TestOfflineSigUnknownTransientType(t *testing.T) {
 		Payload:          []byte("test"),
 	}
 
-	// Marshal should succeed (validation happens at unmarshal or verification time)
-	// But the transient key length will be 0, causing an issue
-	// Actually, getPublicKeyLength returns 0 for unknown types, so marshal will use 0 length
-	// Let's test that the marshal completes but produces invalid data
-	data, err := pkt.Marshal()
-	require.NoError(t, err, "marshal completes even with unknown transient type")
-
-	// Unmarshal should fail
-	pkt2 := &Packet{}
-	err = pkt2.Unmarshal(data)
-	assert.Error(t, err, "unmarshal should fail when transient signature type is unknown")
-	assert.Contains(t, err.Error(), "cannot determine transient public key length")
+	// Marshal should fail because getPublicKeyLength returns 0 for unknown type
+	// This causes a length mismatch when we have 32 bytes but expect 0
+	_, err = pkt.Marshal()
+	assert.Error(t, err, "marshal should fail when transient signature type is unknown")
+	assert.Contains(t, err.Error(), "transient public key length mismatch")
 }
