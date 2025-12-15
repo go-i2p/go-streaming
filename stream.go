@@ -156,11 +156,13 @@ type StreamConn struct {
 	totalBytesReceived uint64 // Total bytes received (for statistics)
 
 	// Flow control - packet-based per I2P spec (not byte-based)
-	windowSize uint32        // Current window size in packets (max 128)
-	cwnd       uint32        // Congestion window for slow start / congestion avoidance
-	ssthresh   uint32        // Slow start threshold
-	rtt        time.Duration // Round trip time estimate
-	rto        time.Duration // Retransmission timeout
+	windowSize  uint32        // Current window size in packets (max 128)
+	cwnd        uint32        // Congestion window for slow start / congestion avoidance
+	ssthresh    uint32        // Slow start threshold
+	rtt         time.Duration // Round trip time estimate (last measured RTT)
+	rto         time.Duration // Retransmission timeout
+	srtt        time.Duration // Smoothed RTT per RFC 6298
+	rttVariance time.Duration // RTT variance per RFC 6298
 
 	// Choking mechanism per I2P streaming spec
 	// optDelay field: 0-60000ms = advisory delay, >60000 = choked
@@ -371,6 +373,9 @@ func DialWithMTU(session *go_i2cp.Session, dest *go_i2cp.Destination, localPort,
 
 	// Start receive loop goroutine
 	go conn.receiveLoop()
+
+	// Start retransmission timer goroutine for timeout-based retransmission
+	go conn.retransmitTimer()
 
 	log.Info().
 		Str("state", conn.state.String()).
@@ -1087,6 +1092,109 @@ func (e *timeoutError) Temporary() bool { return true }
 // Updated in Phase 3: Now uses callback-driven packet delivery instead of polling.
 // Packets arrive via handleIncomingPacket() which is called by StreamManager
 // when the I2CP OnMessage callback fires.
+
+// retransmitTimer periodically checks for packets that have timed out and need retransmission.
+// Implements RFC 6298 timeout-based retransmission with exponential backoff.
+// Runs until connection closes or max retries exceeded.
+func (s *StreamConn) retransmitTimer() {
+	log.Debug().Msg("retransmit timer started")
+	defer log.Debug().Msg("retransmit timer stopped")
+
+	// Check every 100ms for timeouts (fine-grained for responsive retransmission)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.checkRetransmissions(); err != nil {
+				// Fatal error (max retries exceeded) - close connection
+				log.Error().Err(err).Msg("retransmission failed, closing connection")
+				s.Close()
+				return
+			}
+		}
+	}
+}
+
+// checkRetransmissions scans sent packets for timeouts and retransmits them.
+// Implements exponential backoff per RFC 6298: double RTO on timeout (max 60s).
+// Returns error if max retries (10) exceeded for any packet.
+func (s *StreamConn) checkRetransmissions() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Skip if no RTO calculated yet (need at least one RTT measurement)
+	if s.rto == 0 {
+		return nil
+	}
+
+	now := time.Now()
+	var timedOutSeqs []uint32
+
+	// Find all timed-out packets
+	for seq, info := range s.sentPackets {
+		// Check if packet has timed out
+		if now.Sub(info.sentTime) > s.rto {
+			timedOutSeqs = append(timedOutSeqs, seq)
+		}
+	}
+
+	// Nothing timed out
+	if len(timedOutSeqs) == 0 {
+		return nil
+	}
+
+	// Apply exponential backoff on first timeout
+	// Per RFC 6298: RTO = RTO * 2 (capped at 60 seconds)
+	oldRTO := s.rto
+	s.rto = s.rto * 2
+	if s.rto > 60*time.Second {
+		s.rto = 60 * time.Second
+	}
+
+	log.Debug().
+		Int("count", len(timedOutSeqs)).
+		Dur("oldRTO", oldRTO).
+		Dur("newRTO", s.rto).
+		Msg("packets timed out, applying exponential backoff")
+
+	// Retransmit each timed-out packet
+	for _, seq := range timedOutSeqs {
+		info := s.sentPackets[seq]
+
+		// Check max retries BEFORE incrementing (retransmitPacketLocked will increment)
+		// 10 attempts = 1 original + 9 retransmissions, so check if we're at 10
+		if info.retryCount >= 10 {
+			log.Error().
+				Uint32("seq", seq).
+				Int("retries", info.retryCount).
+				Msg("max retransmissions exceeded")
+			return fmt.Errorf("max retransmissions exceeded for packet %d", seq)
+		}
+
+		// Retransmit packet (this will increment retryCount and update sentTime)
+		if err := s.retransmitPacketLocked(seq); err != nil {
+			log.Warn().
+				Err(err).
+				Uint32("seq", seq).
+				Msg("timeout retransmission failed")
+			// Continue trying other packets
+			continue
+		}
+
+		log.Debug().
+			Uint32("seq", seq).
+			Int("retryCount", info.retryCount).
+			Dur("rto", s.rto).
+			Msg("retransmitted packet due to timeout")
+	}
+
+	return nil
+}
+
 func (s *StreamConn) receiveLoop() {
 	log.Debug().Msg("receive loop started")
 	defer log.Debug().Msg("receive loop stopped")
@@ -1289,8 +1397,77 @@ func (s *StreamConn) handleAckLocked(pkt *Packet) error {
 			Uint32("ackThrough", s.ackThrough).
 			Msg("updated ackThrough")
 
+		// RTT measurement and RTO calculation per RFC 6298
+		// Measure RTT from the ACKed packet's sent time
+		// MUST be done BEFORE cleanupAckedPacketsLocked deletes the packet info
+		if info, exists := s.sentPackets[pkt.AckThrough]; exists {
+			// Calculate RTT: time elapsed since packet was sent
+			rtt := time.Since(info.sentTime)
+			s.rtt = rtt // Store last measured RTT
+
+			// RFC 6298 RTT estimation algorithm
+			// First RTT measurement: initialize SRTT and RTTVAR
+			if s.srtt == 0 {
+				s.srtt = rtt
+				s.rttVariance = rtt / 2
+				log.Debug().
+					Dur("rtt", rtt).
+					Dur("srtt", s.srtt).
+					Dur("rttVar", s.rttVariance).
+					Msg("first RTT measurement")
+			} else {
+				// Subsequent measurements: use exponential weighted moving average
+				// RTTVAR = (1 - beta) * RTTVAR + beta * |SRTT - RTT|
+				// SRTT = (1 - alpha) * SRTT + alpha * RTT
+				// where alpha = 1/8, beta = 1/4 per RFC 6298
+
+				const alpha = 0.125 // 1/8
+				const beta = 0.25   // 1/4
+
+				// Calculate absolute difference between SRTT and RTT
+				var diff time.Duration
+				if s.srtt > rtt {
+					diff = s.srtt - rtt
+				} else {
+					diff = rtt - s.srtt
+				}
+
+				// Update RTTVAR and SRTT using exponential moving average
+				s.rttVariance = time.Duration(float64(s.rttVariance)*(1-beta) + beta*float64(diff))
+				s.srtt = time.Duration(float64(s.srtt)*(1-alpha) + alpha*float64(rtt))
+
+				log.Debug().
+					Dur("rtt", rtt).
+					Dur("srtt", s.srtt).
+					Dur("rttVar", s.rttVariance).
+					Msg("updated RTT estimate")
+			}
+
+			// Calculate RTO = SRTT + 4 * RTTVAR
+			// This formula gives a conservative estimate that adapts to variance
+			s.rto = s.srtt + 4*s.rttVariance
+
+			// Enforce RTO bounds per RFC 6298
+			// Minimum: 1 second (prevents aggressive retransmission)
+			// Maximum: 60 seconds (prevents excessive wait)
+			const minRTO = 1 * time.Second
+			const maxRTO = 60 * time.Second
+
+			if s.rto < minRTO {
+				s.rto = minRTO
+			}
+			if s.rto > maxRTO {
+				s.rto = maxRTO
+			}
+
+			log.Debug().
+				Dur("rto", s.rto).
+				Msg("calculated RTO")
+		}
+
 		// Clean up ACKed packets from sent packet tracking
 		// Remove all packets with sequence <= ackThrough
+		// Done AFTER RTT measurement so packet info is available
 		s.cleanupAckedPacketsLocked(oldAck, pkt.AckThrough)
 
 		// Slow start / congestion avoidance algorithm
@@ -1327,6 +1504,29 @@ func (s *StreamConn) handleAckLocked(pkt *Packet) error {
 		log.Debug().
 			Int("nackCount", len(pkt.NACKs)).
 			Msg("processing NACK requests")
+
+		// Congestion detection: NACKs indicate packet loss
+		// Implement TCP-style multiplicative decrease response
+		// Per RFC 5681: reduce ssthresh and cwnd on loss detection
+		oldCwnd := s.cwnd
+		oldSsthresh := s.ssthresh
+
+		// Set ssthresh to half of current cwnd, minimum 2 packets
+		// This is the standard TCP congestion avoidance response
+		s.ssthresh = max(s.cwnd/2, 2)
+
+		// Set cwnd to ssthresh (fast recovery without going back to cwnd=1)
+		// This allows the connection to maintain some throughput during recovery
+		s.cwnd = s.ssthresh
+		s.windowSize = s.cwnd
+
+		log.Debug().
+			Uint32("oldCwnd", oldCwnd).
+			Uint32("newCwnd", s.cwnd).
+			Uint32("oldSsthresh", oldSsthresh).
+			Uint32("newSsthresh", s.ssthresh).
+			Int("nackCount", len(pkt.NACKs)).
+			Msg("congestion detected: reduced window due to packet loss")
 
 		for _, nackSeq := range pkt.NACKs {
 			if err := s.retransmitPacketLocked(nackSeq); err != nil {
