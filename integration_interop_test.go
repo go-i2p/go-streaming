@@ -77,7 +77,21 @@ func TestJavaI2P_SessionCreation(t *testing.T) {
 	t.Log("    - OnDestination:   handleDestinationResult")
 	t.Log("    - OnMessageStatus: handleMessageStatus")
 
+	t.Log("")
+	t.Log("Step 3.5: Configuring session properties...")
+	// Configure session matching go-i2cp integration test pattern
+	manager.session.Config().SetProperty(go_i2cp.SESSION_CONFIG_PROP_I2CP_FAST_RECEIVE, "true")
+	manager.session.Config().SetProperty(go_i2cp.SESSION_CONFIG_PROP_OUTBOUND_NICKNAME, "go-streaming-integration-test")
+	manager.session.Config().SetProperty(go_i2cp.SESSION_CONFIG_PROP_INBOUND_QUANTITY, "2")
+	manager.session.Config().SetProperty(go_i2cp.SESSION_CONFIG_PROP_OUTBOUND_QUANTITY, "2")
+	t.Log("  ✓ Session configured with:")
+	t.Log("    - outbound.nickname: go-streaming-integration-test")
+	t.Log("    - inbound.quantity:  2 tunnels")
+	t.Log("    - outbound.quantity: 2 tunnels")
+	t.Log("    - fastReceive:       enabled")
+
 	// Start ProcessIO BEFORE creating session
+	t.Log("")
 	t.Log("Step 4: Starting ProcessIO loop...")
 	processIOStarted := make(chan struct{})
 	go func() {
