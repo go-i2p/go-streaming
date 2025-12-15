@@ -162,8 +162,10 @@ type StreamConn struct {
 
 	// Choking mechanism per I2P streaming spec
 	// optDelay field: 0-60000ms = advisory delay, >60000 = choked
-	optDelay uint16 // Optional delay field from last packet
-	choked   bool   // Are we being choked by receiver?
+	optDelay        uint16 // Optional delay field from last packet
+	choked          bool   // Are we being choked by remote peer (sender-side)?
+	sendingChoke    bool   // Are we sending choke signals to remote peer (receiver-side)?
+	lastBufferCheck int64  // Last time we checked buffer usage (TotalWritten value)
 
 	// MTU negotiation
 	localMTU  uint16 // Our advertised MTU
@@ -1308,7 +1310,12 @@ func (s *StreamConn) handleDataLocked(pkt *Packet) error {
 		n, err := s.recvBuf.Write(pkt.Payload)
 		if err != nil {
 			log.Error().Err(err).Msg("receive buffer full")
-			// TODO: Set choke flag
+			// Buffer full - send choke signal
+			if !s.sendingChoke {
+				if err := s.sendChokeSignalLocked(); err != nil {
+					log.Warn().Err(err).Msg("failed to send choke signal")
+				}
+			}
 			return fmt.Errorf("write to receive buffer: %w", err)
 		}
 
@@ -1332,14 +1339,41 @@ func (s *StreamConn) handleDataLocked(pkt *Packet) error {
 			s.ackThrough = pkt.AckThrough
 		}
 
+		// Check buffer usage and manage choke state
+		// Only check if buffer usage has changed significantly to avoid overhead
+		currentBufferUsed := s.recvBuf.TotalWritten()
+		if currentBufferUsed != s.lastBufferCheck {
+			s.lastBufferCheck = currentBufferUsed
+			bufferSize := int64(s.recvBuf.Size())
+			bufferUsage := float64(currentBufferUsed) / float64(bufferSize)
+
+			// Buffer usage thresholds per I2P streaming best practices:
+			// - Choke at 80% to prevent overflow
+			// - Unchoke at 30% to resume flow with hysteresis
+			if bufferUsage > 0.8 && !s.sendingChoke {
+				// Buffer 80% full - send choke signal
+				if err := s.sendChokeSignalLocked(); err != nil {
+					log.Warn().Err(err).Msg("failed to send choke signal")
+				}
+			} else if bufferUsage < 0.3 && s.sendingChoke {
+				// Buffer below 30% - send unchoke signal
+				if err := s.sendUnchokeSignalLocked(); err != nil {
+					log.Warn().Err(err).Msg("failed to send unchoke signal")
+				}
+			}
+		}
+
 		// Wake up any blocked Read() calls
 		s.recvCond.Broadcast()
 
 		// Send ACK for this packet (with NACKs if any gaps exist)
-		if err := s.sendAckLocked(); err != nil {
-			log.Warn().
-				Err(err).
-				Msg("failed to send ACK")
+		// Skip if we just sent a choke/unchoke signal (already includes ACK)
+		if !s.sendingChoke || len(s.nackList) > 0 {
+			if err := s.sendAckLocked(); err != nil {
+				log.Warn().
+					Err(err).
+					Msg("failed to send ACK")
+			}
 		}
 
 		return nil
@@ -1569,6 +1603,71 @@ func (s *StreamConn) sendAckLocked() error {
 			Int("nackCount", len(pkt.NACKs)).
 			Msg("including NACKs in ACK packet")
 	}
+
+	return s.sendPacketLocked(pkt)
+}
+
+// sendChokeSignalLocked sends a choke signal to the remote peer indicating our receive buffer is full.
+// Per I2P streaming spec, OptionalDelay > 60000 indicates a choked state.
+// This tells the sender to pause transmission until we send an unchoke signal.
+// Must be called with s.mu held.
+func (s *StreamConn) sendChokeSignalLocked() error {
+	pkt := &Packet{
+		SendStreamID:  s.localStreamID,
+		RecvStreamID:  s.remoteStreamID,
+		SequenceNum:   s.sendSeq,
+		AckThrough:    s.recvSeq - 1,
+		Flags:         FlagACK | FlagDelayRequested,
+		OptionalDelay: 61000, // >60000 = choked per I2P streaming spec
+	}
+
+	// Include NACKs if we have any gaps (even when choked, request missing packets)
+	if len(s.nackList) > 0 {
+		maxNacks := 255
+		if len(s.nackList) < maxNacks {
+			maxNacks = len(s.nackList)
+		}
+		pkt.NACKs = make([]uint32, maxNacks)
+		copy(pkt.NACKs, s.nackList[:maxNacks])
+	}
+
+	s.sendingChoke = true
+
+	log.Debug().
+		Float64("bufferUsage", float64(s.recvBuf.TotalWritten())/float64(s.recvBuf.Size())).
+		Msg("sending choke signal to peer")
+
+	return s.sendPacketLocked(pkt)
+}
+
+// sendUnchokeSignalLocked sends an unchoke signal to the remote peer indicating our receive buffer has space.
+// This tells the sender they can resume transmission.
+// Must be called with s.mu held.
+func (s *StreamConn) sendUnchokeSignalLocked() error {
+	pkt := &Packet{
+		SendStreamID:  s.localStreamID,
+		RecvStreamID:  s.remoteStreamID,
+		SequenceNum:   s.sendSeq,
+		AckThrough:    s.recvSeq - 1,
+		Flags:         FlagACK | FlagDelayRequested,
+		OptionalDelay: 0, // 0-60000 = not choked
+	}
+
+	// Include NACKs if we have any gaps
+	if len(s.nackList) > 0 {
+		maxNacks := 255
+		if len(s.nackList) < maxNacks {
+			maxNacks = len(s.nackList)
+		}
+		pkt.NACKs = make([]uint32, maxNacks)
+		copy(pkt.NACKs, s.nackList[:maxNacks])
+	}
+
+	s.sendingChoke = false
+
+	log.Debug().
+		Float64("bufferUsage", float64(s.recvBuf.TotalWritten())/float64(s.recvBuf.Size())).
+		Msg("sending unchoke signal to peer")
 
 	return s.sendPacketLocked(pkt)
 }
