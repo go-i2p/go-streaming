@@ -272,9 +272,45 @@ func Dial(session *go_i2cp.Session, dest *go_i2cp.Destination, localPort, remote
 	return DialWithMTU(session, dest, localPort, remotePort, DefaultMTU, DefaultConnectTimeout)
 }
 
+// DialWithManager initiates a connection using a StreamManager for packet routing.
+// This is the recommended way to create outgoing connections as it integrates with I2CP callbacks.
+// The manager will route incoming packets to this connection automatically.
+func DialWithManager(manager *StreamManager, dest *go_i2cp.Destination, localPort, remotePort uint16) (*StreamConn, error) {
+	if manager == nil {
+		return nil, fmt.Errorf("manager cannot be nil")
+	}
+
+	session := manager.Session()
+	conn, err := createConnectionStruct(session, manager, dest, localPort, remotePort, DefaultMTU)
+	if err != nil {
+		return nil, err
+	}
+
+	// Register connection with manager BEFORE handshake so SYN-ACK can be routed
+	manager.RegisterConnection(localPort, remotePort, conn)
+
+	// Perform handshake
+	if err := performHandshake(conn, DefaultConnectTimeout); err != nil {
+		manager.UnregisterConnection(localPort, remotePort)
+		return nil, err
+	}
+
+	return conn, nil
+}
+
 // DialWithMTU is like Dial but allows specifying a custom MTU and timeout.
 // Use ECIESMTU (1812) for ECIES-X25519 connections for better efficiency.
 func DialWithMTU(session *go_i2cp.Session, dest *go_i2cp.Destination, localPort, remotePort uint16, mtu int, timeout time.Duration) (*StreamConn, error) {
+	conn, err := createConnectionStruct(session, nil, dest, localPort, remotePort, mtu)
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, performHandshake(conn, timeout)
+}
+
+// createConnectionStruct creates a new StreamConn structure without performing the handshake.
+func createConnectionStruct(session *go_i2cp.Session, manager *StreamManager, dest *go_i2cp.Destination, localPort, remotePort uint16, mtu int) (*StreamConn, error) {
 	if mtu < MinMTU {
 		return nil, fmt.Errorf("MTU %d is below minimum %d", mtu, MinMTU)
 	}
@@ -295,7 +331,7 @@ func DialWithMTU(session *go_i2cp.Session, dest *go_i2cp.Destination, localPort,
 	}
 
 	// Generate random stream ID per I2P streaming spec
-	localStreamID, err := generateStreamID()
+	localStreamID, err := generateISN()
 	if err != nil {
 		return nil, fmt.Errorf("generate stream ID: %w", err)
 	}
@@ -311,6 +347,7 @@ func DialWithMTU(session *go_i2cp.Session, dest *go_i2cp.Destination, localPort,
 
 	// Initialize connection structure
 	conn := &StreamConn{
+		manager:        manager,
 		session:        session,
 		dest:           dest,
 		localPort:      localPort,
@@ -342,22 +379,26 @@ func DialWithMTU(session *go_i2cp.Session, dest *go_i2cp.Destination, localPort,
 		Int("mtu", mtu).
 		Msg("initiating connection")
 
+	return conn, nil
+}
+
+// performHandshake executes the three-way handshake for a connection.
+func performHandshake(conn *StreamConn, timeout time.Duration) error {
 	// Send SYN packet
 	if err := conn.sendSYN(); err != nil {
-		return nil, fmt.Errorf("send SYN: %w", err)
+		return fmt.Errorf("send SYN: %w", err)
 	}
 
 	// Transition to SYN_SENT state
 	conn.setState(StateSynSent)
 
 	// Wait for SYN-ACK with timeout
-	// MVP: Use simple polling instead of sophisticated channel-based waiting
 	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), timeout)
 	defer timeoutCancel()
 
 	synAck, err := conn.waitForSynAck(timeoutCtx)
 	if err != nil {
-		return nil, fmt.Errorf("wait for SYN-ACK: %w", err)
+		return fmt.Errorf("wait for SYN-ACK: %w", err)
 	}
 
 	// Process SYN-ACK: extract remote ISN and MTU
@@ -365,7 +406,7 @@ func DialWithMTU(session *go_i2cp.Session, dest *go_i2cp.Destination, localPort,
 
 	// Send final ACK to complete handshake
 	if err := conn.sendACK(); err != nil {
-		return nil, fmt.Errorf("send ACK: %w", err)
+		return fmt.Errorf("send ACK: %w", err)
 	}
 
 	// Transition to ESTABLISHED state
@@ -383,7 +424,7 @@ func DialWithMTU(session *go_i2cp.Session, dest *go_i2cp.Destination, localPort,
 		Dur("rtt", conn.rtt).
 		Msg("connection established")
 
-	return conn, nil
+	return nil
 }
 
 // sendSYN sends a SYN packet to initiate the handshake.
@@ -454,25 +495,27 @@ func (s *StreamConn) sendSYN() error {
 }
 
 // waitForSynAck polls for incoming SYN-ACK packet.
-// MVP implementation uses simple polling with time.Sleep().
-// This will be replaced with channel-based approach in later phases.
+// Reads from recvChan which is populated by handleIncomingPacket.
 func (s *StreamConn) waitForSynAck(ctx context.Context) (*Packet, error) {
-	// MVP: Simple polling approach
-	// In Phase 4, we'll have a proper receive goroutine with channels
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	log.Debug().Msg("waiting for SYN-ACK (MVP: polling not yet implemented)")
+	log.Debug().Msg("waiting for SYN-ACK")
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, fmt.Errorf("timeout waiting for SYN-ACK: %w", ctx.Err())
-		case <-ticker.C:
-			// TODO: In Phase 4, implement actual packet reception
-			// For now, this is a placeholder for the structure
-			// Real implementation will check incoming message queue
-			continue
+		case pkt := <-s.recvChan:
+			// Check if this is a SYN-ACK packet
+			if pkt.Flags&FlagSYN != 0 && pkt.Flags&FlagACK != 0 {
+				log.Debug().
+					Uint32("seq", pkt.SequenceNum).
+					Uint32("ack", pkt.AckThrough).
+					Msg("received SYN-ACK")
+				return pkt, nil
+			}
+			// Not a SYN-ACK, keep waiting
+			log.Debug().
+				Uint16("flags", pkt.Flags).
+				Msg("received non-SYN-ACK packet while waiting, ignoring")
 		}
 	}
 }

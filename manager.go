@@ -41,9 +41,21 @@ type StreamManager struct {
 	processorWg     sync.WaitGroup
 
 	// Session lifecycle
-	sessionReady chan struct{}
-	mu           sync.Mutex
-	closed       bool
+	sessionReady  chan struct{}
+	leaseSetReady chan struct{}
+	leaseSetOnce  sync.Once
+	mu            sync.Mutex
+	closed        bool
+
+	// Destination lookup results
+	lookupResults sync.Map // map[uint32]*lookupResult
+}
+
+// lookupResult stores the result of a destination lookup
+type lookupResult struct {
+	address string
+	dest    *go_i2cp.Destination
+	ready   chan struct{}
 }
 
 // connKey uniquely identifies a connection
@@ -82,6 +94,7 @@ func NewStreamManager(client *go_i2cp.Client) (*StreamManager, error) {
 		client:          client,
 		incomingPackets: make(chan *incomingPacket, 100),
 		sessionReady:    make(chan struct{}, 1), // Buffered: prevents race if callback fires before select
+		leaseSetReady:   make(chan struct{}),    // Non-buffered: signal can only fire once via sync.Once
 		processorCtx:    ctx,
 		processorCancel: cancel,
 	}
@@ -92,6 +105,7 @@ func NewStreamManager(client *go_i2cp.Client) (*StreamManager, error) {
 		OnStatus:        sm.handleSessionStatus,
 		OnDestination:   sm.handleDestinationResult,
 		OnMessageStatus: sm.handleMessageStatus,
+		OnLeaseSet2:     sm.handleLeaseSet2,
 	}
 
 	sm.session = go_i2cp.NewSession(client, callbacks)
@@ -173,6 +187,36 @@ func (sm *StreamManager) UnregisterListener(port uint16) {
 	log.Debug().
 		Uint16("port", port).
 		Msg("unregistered listener")
+}
+
+// LookupDestination performs a destination lookup and waits for the result.
+// This is a convenience method that handles the request tracking and result retrieval.
+func (sm *StreamManager) LookupDestination(ctx context.Context, hostname string) (*go_i2cp.Destination, error) {
+	// Register result tracker
+	result := &lookupResult{
+		ready: make(chan struct{}),
+	}
+
+	// Initiate lookup
+	requestID, err := sm.client.DestinationLookup(ctx, sm.session, hostname)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initiate lookup: %w", err)
+	}
+
+	// Store the result tracker
+	sm.lookupResults.Store(requestID, result)
+	defer sm.lookupResults.Delete(requestID)
+
+	// Wait for result
+	select {
+	case <-result.ready:
+		if result.dest == nil {
+			return nil, fmt.Errorf("destination lookup failed for %s", hostname)
+		}
+		return result.dest, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // RegisterConnection registers a connection for incoming packet routing.
@@ -321,8 +365,13 @@ func (sm *StreamManager) handleDestinationResult(
 			Msg("destination lookup failed")
 	}
 
-	// TODO: Implement destination caching (see integration guide Pattern 3)
-	// For now, this is a placeholder for future enhancements
+	// Store the lookup result
+	if result, ok := sm.lookupResults.Load(requestId); ok {
+		lr := result.(*lookupResult)
+		lr.address = address
+		lr.dest = dest
+		close(lr.ready)
+	}
 }
 
 // handleMessageStatus tracks message delivery status.
@@ -449,6 +498,22 @@ func (sm *StreamManager) closeAllConnections() {
 			conn.Close()
 		}
 		return true
+	})
+}
+
+// handleLeaseSet2 is called when the I2P router publishes our LeaseSet.
+// This indicates that our inbound tunnels are ready and the router has
+// published our destination to the network, allowing other peers to reach us.
+func (sm *StreamManager) handleLeaseSet2(session *go_i2cp.Session, leaseSet *go_i2cp.LeaseSet2) {
+	log.Info().
+		Uint8("type", leaseSet.Type()).
+		Int("leases", leaseSet.LeaseCount()).
+		Time("expires", leaseSet.Expires()).
+		Msg("LeaseSet published")
+
+	// Signal that our LeaseSet is ready (only once)
+	sm.leaseSetOnce.Do(func() {
+		close(sm.leaseSetReady)
 	})
 }
 
