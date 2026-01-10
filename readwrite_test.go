@@ -2,15 +2,11 @@ package streaming
 
 import (
 	"bytes"
-	"context"
 	"io"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/armon/circbuf"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // TestWrite_SinglePacket tests writing data that fits in one packet
@@ -362,38 +358,12 @@ func TestClose_WakesBlockedReaders(t *testing.T) {
 
 // Helper functions
 
-// createTestConnection creates a StreamConn for testing
+// createTestConnection creates a StreamConn for testing with real I2CP
 func createTestConnection(t *testing.T) *StreamConn {
-	recvBuf, err := circbuf.NewBuffer(64 * 1024)
-	require.NoError(t, err)
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	conn := &StreamConn{
-		session:    nil, // MVP: No mock session for basic tests
-		dest:       nil,
-		localPort:  12345,
-		remotePort: 80,
-		sendSeq:    generateTestISN(),
-		recvSeq:    100,
-		windowSize: DefaultWindowSize,
-		rtt:        8 * time.Second,
-		rto:        9 * time.Second,
-		recvBuf:    recvBuf,
-		recvChan:   make(chan *Packet, 32),
-		errChan:    make(chan error, 1),
-		ctx:        ctx,
-		cancel:     cancel,
-		state:      StateEstablished,
-		localMTU:   DefaultMTU,
-		remoteMTU:  DefaultMTU,
-	}
-	conn.recvCond = sync.NewCond(&conn.mu)
-
-	return conn
+	return CreateTestStreamConn(t)
 }
 
 // generateTestISN generates a fixed ISN for testing
 func generateTestISN() uint32 {
-	return 1000
+	return GenerateTestISN()
 }

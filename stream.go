@@ -1200,6 +1200,26 @@ func (s *StreamConn) Read(buf []byte) (int, error) {
 		Int("bytes", n).
 		Msg("read data")
 
+	// After freeing buffer space, try to deliver any buffered packets
+	// that couldn't be delivered before due to buffer being full
+	if len(s.outOfOrderPackets) > 0 {
+		s.deliverBufferedPacketsLocked()
+	}
+
+	// Check if we should send unchoke signal after freeing buffer space
+	if s.sendingChoke {
+		currentBufferUsed := s.recvBuf.TotalWritten()
+		bufferSize := int64(s.recvBuf.Size())
+		bufferUsage := float64(currentBufferUsed) / float64(bufferSize)
+
+		// Unchoke at 30% to resume flow with hysteresis
+		if bufferUsage < 0.3 {
+			if err := s.sendUnchokeSignalLocked(); err != nil {
+				log.Warn().Err(err).Msg("failed to send unchoke signal after read")
+			}
+		}
+	}
+
 	return n, nil
 }
 
@@ -1715,14 +1735,26 @@ func (s *StreamConn) handleDataLocked(pkt *Packet) error {
 		// Write to receive buffer
 		n, err := s.recvBuf.Write(pkt.Payload)
 		if err != nil {
-			log.Error().Err(err).Msg("receive buffer full")
-			// Buffer full - send choke signal
+			log.Warn().Err(err).Msg("receive buffer full - buffering packet for later")
+			// Buffer full - store packet in out-of-order buffer for later delivery
+			// This prevents data loss when receive buffer is temporarily full
+			s.outOfOrderPackets[seq] = pkt
+
+			// Send choke signal to slow down sender
 			if !s.sendingChoke {
 				if err := s.sendChokeSignalLocked(); err != nil {
 					log.Warn().Err(err).Msg("failed to send choke signal")
 				}
 			}
-			return fmt.Errorf("write to receive buffer: %w", err)
+
+			// Send ACK with current state - sender will retransmit if needed
+			// when we unchoke after buffer space is freed
+			if err := s.sendAckLocked(); err != nil {
+				log.Warn().Err(err).Msg("failed to send ACK during buffer full")
+			}
+
+			// Return nil - packet is buffered, not lost
+			return nil
 		}
 
 		log.Debug().
@@ -2132,15 +2164,9 @@ func (s *StreamConn) sendPacketLocked(pkt *Packet) error {
 			Msg("tracking sent packet for retransmission")
 	}
 
-	// MVP: Skip actual I2CP sending if session is nil (for testing)
+	// Send packet via I2CP
 	if s.session == nil {
-		log.Debug().
-			Uint32("seq", pkt.SequenceNum).
-			Uint32("ack", pkt.AckThrough).
-			Uint16("flags", pkt.Flags).
-			Int("payload", len(pkt.Payload)).
-			Msg("skipped send (no session)")
-		return nil
+		return fmt.Errorf("cannot send packet: no I2CP session")
 	}
 
 	stream := go_i2cp.NewStream(data)
