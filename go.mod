@@ -32,4 +32,4 @@ require (
 )
 
 // Use local go-i2cp with exported SessionCallbacks
-replace github.com/go-i2p/go-i2cp => ../go-i2cp
+replace github.com/go-i2p/go-i2cp => /home/idk/go/src/github.com/go-i2p/go-i2cp

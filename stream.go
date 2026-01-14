@@ -1057,33 +1057,41 @@ func (s *StreamConn) Write(data []byte) (int, error) {
 					Msg("peer is choked - waiting for unchoke or timeout")
 
 				// Wait with timeout if deadline is set
+				// Use a timer to wake up on deadline or choke expiration
+				var timer *time.Timer
+				var timerChan <-chan time.Time
+
 				if !s.writeDeadline.IsZero() {
 					timeout := time.Until(s.writeDeadline)
 					if timeout <= 0 {
 						return 0, &timeoutError{}
 					}
-					// Use a timer to wake up at deadline
-					timer := time.AfterFunc(timeout, func() {
-						s.mu.Lock()
-						if s.sendCond != nil {
-							s.sendCond.Broadcast()
-						}
-						s.mu.Unlock()
-					})
-					defer timer.Stop()
+					timer = time.NewTimer(timeout)
+					timerChan = timer.C
 				} else {
-					// Use a timer to wake up when choke period expires (no deadline)
-					chokeEnd := s.chokedUntil
-					go func() {
-						time.Sleep(time.Until(chokeEnd))
-						s.mu.Lock()
-						if s.sendCond != nil {
-							s.sendCond.Broadcast()
-						}
-						s.mu.Unlock()
-					}()
+					// No deadline: use timer for choke period expiration
+					chokeTimeout := time.Until(s.chokedUntil)
+					if chokeTimeout <= 0 {
+						// Choke period already expired, continue without waiting
+						continue
+					}
+					timer = time.NewTimer(chokeTimeout)
+					timerChan = timer.C
 				}
+
+				// Wait for either condition variable signal or timer
+				// Use a goroutine to broadcast from timer
+				go func() {
+					<-timerChan
+					s.mu.Lock()
+					if s.sendCond != nil {
+						s.sendCond.Broadcast()
+					}
+					s.mu.Unlock()
+				}()
+
 				s.sendCond.Wait()
+				timer.Stop()
 
 				// Recheck deadline after waking
 				if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
@@ -1273,21 +1281,28 @@ func (s *StreamConn) Read(buf []byte) (int, error) {
 		}
 
 		// Wait with timeout if deadline is set
+		var timer *time.Timer
 		if !s.readDeadline.IsZero() {
 			timeout := time.Until(s.readDeadline)
 			if timeout <= 0 {
 				return 0, &timeoutError{}
 			}
-			// Use a timer to wake up at deadline
-			timer := time.AfterFunc(timeout, func() {
+			// Create timer to wake up at deadline
+			timer = time.NewTimer(timeout)
+			go func() {
+				<-timer.C
 				s.mu.Lock()
 				s.recvCond.Broadcast()
 				s.mu.Unlock()
-			})
-			defer timer.Stop()
+			}()
 		}
 
 		s.recvCond.Wait()
+
+		// Clean up timer after waking from Wait()
+		if timer != nil {
+			timer.Stop()
+		}
 
 		// Recheck deadline after waking
 		if !s.readDeadline.IsZero() && time.Now().After(s.readDeadline) {

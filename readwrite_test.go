@@ -3,6 +3,7 @@ package streaming
 import (
 	"bytes"
 	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -454,6 +455,136 @@ func TestWrite_ZeroDeadlineNeverExpires(t *testing.T) {
 	// Should succeed
 	assert.NoError(t, err)
 	assert.Equal(t, len(data), n)
+}
+
+// TestWrite_ChokeTimerCleanup verifies that timers are properly cleaned up
+// when Write() exits due to unchoke or connection close, preventing goroutine leaks
+func TestWrite_ChokeTimerCleanup(t *testing.T) {
+	conn := createTestConnection(t)
+	defer conn.Close()
+
+	// Set up choke that will expire very soon
+	conn.mu.Lock()
+	conn.choked = true
+	conn.chokedUntil = time.Now().Add(50 * time.Millisecond)
+	conn.mu.Unlock()
+
+	// Write should block briefly during choke, then succeed
+	data := []byte("test")
+	start := time.Now()
+	n, err := conn.Write(data)
+	elapsed := time.Since(start)
+
+	// Should succeed after choke period
+	assert.NoError(t, err)
+	assert.Equal(t, len(data), n)
+
+	// Verify we actually waited (but not too long)
+	assert.Greater(t, elapsed, 40*time.Millisecond)
+	assert.Less(t, elapsed, 500*time.Millisecond)
+
+	// Give time for any lingering goroutines to finish
+	time.Sleep(100 * time.Millisecond)
+}
+
+// TestRead_TimerCleanupMultipleWaits verifies that Read() timers are properly
+// cleaned up on each Wait() call, preventing timer accumulation
+func TestRead_TimerCleanupMultipleWaits(t *testing.T) {
+	conn := createTestConnection(t)
+	defer conn.Close()
+
+	// Set a read deadline
+	conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+
+	// Start a goroutine to write data after a delay
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		conn.mu.Lock()
+		_, _ = conn.recvBuf.Write([]byte("first"))
+		conn.recvCond.Broadcast()
+		conn.mu.Unlock()
+
+		time.Sleep(50 * time.Millisecond)
+		conn.mu.Lock()
+		_, _ = conn.recvBuf.Write([]byte("second"))
+		conn.recvCond.Broadcast()
+		conn.mu.Unlock()
+
+		time.Sleep(50 * time.Millisecond)
+		conn.mu.Lock()
+		_, _ = conn.recvBuf.Write([]byte("third"))
+		conn.recvCond.Broadcast()
+		conn.mu.Unlock()
+	}()
+
+	// Multiple reads should succeed with proper timer cleanup
+	buf1 := make([]byte, 10)
+	n1, err1 := conn.Read(buf1)
+	assert.NoError(t, err1)
+	assert.Equal(t, 5, n1)
+	assert.Equal(t, "first", string(buf1[:n1]))
+
+	buf2 := make([]byte, 10)
+	n2, err2 := conn.Read(buf2)
+	assert.NoError(t, err2)
+	assert.Equal(t, 6, n2)
+	assert.Equal(t, "second", string(buf2[:n2]))
+
+	buf3 := make([]byte, 10)
+	n3, err3 := conn.Read(buf3)
+	assert.NoError(t, err3)
+	assert.Equal(t, 5, n3)
+	assert.Equal(t, "third", string(buf3[:n3]))
+}
+
+// TestRead_DeadlineExpiresDuringFirstWait verifies that deadlines work correctly
+// even when the Read() method needs to wait for data
+func TestRead_DeadlineExpiresDuringFirstWait(t *testing.T) {
+	conn := createTestConnection(t)
+	defer conn.Close()
+
+	// Set a very short read deadline
+	conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+
+	// Read should timeout waiting for data
+	buf := make([]byte, 10)
+	n, err := conn.Read(buf)
+
+	// Should timeout
+	assert.Error(t, err)
+	assert.Equal(t, 0, n)
+	if netErr, ok := err.(net.Error); ok {
+		assert.True(t, netErr.Timeout(), "error should be a timeout error")
+	}
+}
+
+// TestWrite_ChokeWithoutDeadlineTimerCleanup verifies that Write() correctly
+// handles the choke expiration timer (non-deadline case) and cleans up properly
+func TestWrite_ChokeWithoutDeadlineTimerCleanup(t *testing.T) {
+	conn := createTestConnection(t)
+	defer conn.Close()
+
+	// Choke for a short period with no write deadline
+	conn.mu.Lock()
+	conn.choked = true
+	conn.chokedUntil = time.Now().Add(75 * time.Millisecond)
+	conn.mu.Unlock()
+
+	data := []byte("data")
+	start := time.Now()
+	n, err := conn.Write(data)
+	elapsed := time.Since(start)
+
+	// Should succeed after choke expires
+	assert.NoError(t, err)
+	assert.Equal(t, len(data), n)
+
+	// Verify we waited for the choke period
+	assert.Greater(t, elapsed, 60*time.Millisecond)
+	assert.Less(t, elapsed, 500*time.Millisecond)
+
+	// Give goroutines time to finish
+	time.Sleep(100 * time.Millisecond)
 }
 
 // Helper functions
