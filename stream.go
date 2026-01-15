@@ -1039,6 +1039,221 @@ func (s *StreamConn) sendSynAck() error {
 	return nil
 }
 
+// validateWriteStateLocked checks if the connection is in a valid state for writing.
+// Returns an error if the connection is closed, not established, or deadline exceeded.
+// Must be called with s.mu held.
+func (s *StreamConn) validateWriteStateLocked() error {
+	if s.closed {
+		return fmt.Errorf("connection closed")
+	}
+	if s.state != StateEstablished {
+		return fmt.Errorf("connection not established (state: %s)", s.state)
+	}
+	if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
+		return &timeoutError{}
+	}
+	return nil
+}
+
+// checkWriteDeadlineLocked checks if the write deadline has been exceeded.
+// Returns a timeoutError if the deadline has passed, nil otherwise.
+// Must be called with s.mu held.
+func (s *StreamConn) checkWriteDeadlineLocked() error {
+	if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
+		return &timeoutError{}
+	}
+	return nil
+}
+
+// waitForChokeCondVar waits for the choke period to expire using condition variables.
+// Returns an error if deadline exceeded or connection state becomes invalid.
+// Must be called with s.mu held.
+func (s *StreamConn) waitForChokeCondVar() error {
+	for s.choked && time.Now().Before(s.chokedUntil) && !s.closed {
+		if err := s.checkWriteDeadlineLocked(); err != nil {
+			return err
+		}
+
+		log.Debug().
+			Time("chokedUntil", s.chokedUntil).
+			Msg("peer is choked - waiting for unchoke or timeout")
+
+		timer, timerChan := s.createChokeTimer()
+
+		done := make(chan struct{})
+		go func() {
+			select {
+			case <-timerChan:
+				s.mu.Lock()
+				if s.sendCond != nil {
+					s.sendCond.Broadcast()
+				}
+				s.mu.Unlock()
+			case <-done:
+			}
+		}()
+
+		s.sendCond.Wait()
+		timer.Stop()
+		close(done)
+
+		if err := s.checkWriteDeadlineLocked(); err != nil {
+			return err
+		}
+		if err := s.validateWriteStateLocked(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// createChokeTimer creates a timer for the choke wait period.
+// Uses write deadline if set, otherwise uses choke expiration time.
+// Returns the timer and its channel. Must be called with s.mu held.
+func (s *StreamConn) createChokeTimer() (*time.Timer, <-chan time.Time) {
+	if !s.writeDeadline.IsZero() {
+		timeout := time.Until(s.writeDeadline)
+		if timeout <= 0 {
+			timeout = time.Nanosecond
+		}
+		timer := time.NewTimer(timeout)
+		return timer, timer.C
+	}
+	chokeTimeout := time.Until(s.chokedUntil)
+	if chokeTimeout <= 0 {
+		chokeTimeout = time.Nanosecond
+	}
+	timer := time.NewTimer(chokeTimeout)
+	return timer, timer.C
+}
+
+// waitForChokeFallback waits for the choke period using sleep (for tests without sendCond).
+// Returns an error if deadline exceeded or connection state becomes invalid.
+// Must be called with s.mu held; temporarily releases the lock during sleep.
+func (s *StreamConn) waitForChokeFallback() error {
+	waitDuration := time.Until(s.chokedUntil)
+	if !s.writeDeadline.IsZero() {
+		timeUntilDeadline := time.Until(s.writeDeadline)
+		if timeUntilDeadline < waitDuration {
+			waitDuration = timeUntilDeadline
+		}
+	}
+
+	if waitDuration <= 0 {
+		return &timeoutError{}
+	}
+
+	log.Debug().
+		Dur("waitDuration", waitDuration).
+		Msg("peer is choked - waiting before sending (fallback)")
+
+	s.mu.Unlock()
+	time.Sleep(waitDuration)
+	s.mu.Lock()
+
+	if err := s.checkWriteDeadlineLocked(); err != nil {
+		return err
+	}
+	return s.validateWriteStateLocked()
+}
+
+// handleChokeWaitLocked handles waiting when the peer has sent a choke signal.
+// Uses condition variables if available, falls back to sleep otherwise.
+// Must be called with s.mu held.
+func (s *StreamConn) handleChokeWaitLocked() error {
+	if !s.choked || !time.Now().Before(s.chokedUntil) || s.closed {
+		return nil
+	}
+
+	if s.sendCond != nil {
+		return s.waitForChokeCondVar()
+	}
+	return s.waitForChokeFallback()
+}
+
+// waitForWindowSpace waits for space in the congestion window before sending.
+// Returns the number of bytes already written (for partial write reporting) and any error.
+// Must be called with s.mu held.
+func (s *StreamConn) waitForWindowSpace(bytesWritten int) error {
+	for s.sendCond != nil && s.sentPackets != nil && uint32(len(s.sentPackets)) >= s.cwnd && !s.closed {
+		if err := s.checkWriteDeadlineLocked(); err != nil {
+			return err
+		}
+
+		log.Debug().
+			Int("inFlight", len(s.sentPackets)).
+			Uint32("cwnd", s.cwnd).
+			Msg("window full - waiting for ACKs")
+
+		timer, done := s.setupWindowWaitTimer()
+
+		s.sendCond.Wait()
+
+		if timer != nil {
+			timer.Stop()
+			close(done)
+		}
+
+		if err := s.checkWriteDeadlineLocked(); err != nil {
+			return err
+		}
+		if err := s.validateWriteStateLocked(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// setupWindowWaitTimer creates a timer for window wait with deadline support.
+// Returns nil timer and channel if no deadline is set.
+// Must be called with s.mu held.
+func (s *StreamConn) setupWindowWaitTimer() (*time.Timer, chan struct{}) {
+	if s.writeDeadline.IsZero() {
+		return nil, nil
+	}
+
+	timeout := time.Until(s.writeDeadline)
+	if timeout <= 0 {
+		timeout = time.Nanosecond
+	}
+
+	timer := time.NewTimer(timeout)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-timer.C:
+			s.mu.Lock()
+			if s.sendCond != nil {
+				s.sendCond.Broadcast()
+			}
+			s.mu.Unlock()
+		case <-done:
+		}
+	}()
+	return timer, done
+}
+
+// sendDataChunk sends a single chunk of data as a packet.
+// Updates sequence numbers and byte counters. Must be called with s.mu held.
+func (s *StreamConn) sendDataChunk(chunk []byte) error {
+	pkt := &Packet{
+		SendStreamID: s.localStreamID,
+		RecvStreamID: s.remoteStreamID,
+		SequenceNum:  s.sendSeq,
+		AckThrough:   s.recvSeq - 1,
+		Flags:        FlagACK,
+		Payload:      chunk,
+	}
+
+	if err := s.sendPacketLocked(pkt); err != nil {
+		return fmt.Errorf("send packet: %w", err)
+	}
+
+	s.sendSeq++
+	s.totalBytesSent += uint64(len(chunk))
+	return nil
+}
+
 // Write sends data over the connection.
 // Implements the io.Writer interface.
 //
@@ -1057,127 +1272,12 @@ func (s *StreamConn) Write(data []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.closed {
-		return 0, fmt.Errorf("connection closed")
+	if err := s.validateWriteStateLocked(); err != nil {
+		return 0, err
 	}
 
-	if s.state != StateEstablished {
-		return 0, fmt.Errorf("connection not established (state: %s)", s.state)
-	}
-
-	// Check write deadline before any blocking operation
-	if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
-		return 0, &timeoutError{}
-	}
-
-	// Respect choke signals from peer
-	// If sendCond is available, use condition variable (safer, no race condition)
-	// Otherwise fall back to unlock/sleep/lock pattern for backwards compatibility with tests
-	if s.choked && time.Now().Before(s.chokedUntil) && !s.closed {
-		if s.sendCond != nil {
-			// Use condition variable (safer - no race condition)
-			for s.choked && time.Now().Before(s.chokedUntil) && !s.closed {
-				// Check write deadline before waiting
-				if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
-					return 0, &timeoutError{}
-				}
-
-				log.Debug().
-					Time("chokedUntil", s.chokedUntil).
-					Msg("peer is choked - waiting for unchoke or timeout")
-
-				// Wait with timeout if deadline is set
-				// Use a timer to wake up on deadline or choke expiration
-				var timer *time.Timer
-				var timerChan <-chan time.Time
-
-				if !s.writeDeadline.IsZero() {
-					timeout := time.Until(s.writeDeadline)
-					if timeout <= 0 {
-						return 0, &timeoutError{}
-					}
-					timer = time.NewTimer(timeout)
-					timerChan = timer.C
-				} else {
-					// No deadline: use timer for choke period expiration
-					chokeTimeout := time.Until(s.chokedUntil)
-					if chokeTimeout <= 0 {
-						// Choke period already expired, continue without waiting
-						continue
-					}
-					timer = time.NewTimer(chokeTimeout)
-					timerChan = timer.C
-				}
-
-				// Wait for either condition variable signal or timer
-				// Use a done channel for clean goroutine termination
-				done := make(chan struct{})
-				go func() {
-					select {
-					case <-timerChan:
-						s.mu.Lock()
-						if s.sendCond != nil {
-							s.sendCond.Broadcast()
-						}
-						s.mu.Unlock()
-					case <-done:
-						// Early termination - goroutine exits cleanly
-					}
-				}()
-
-				s.sendCond.Wait()
-				timer.Stop()
-				close(done)
-
-				// Recheck deadline after waking
-				if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
-					return 0, &timeoutError{}
-				}
-
-				// Re-check connection state after waking
-				if s.closed {
-					return 0, fmt.Errorf("connection closed")
-				}
-				if s.state != StateEstablished {
-					return 0, fmt.Errorf("connection not established (state: %s)", s.state)
-				}
-			}
-		} else {
-			// Fallback: unlock, sleep, re-lock (for tests without sendCond)
-			waitDuration := time.Until(s.chokedUntil)
-			// Respect write deadline in fallback path too
-			if !s.writeDeadline.IsZero() {
-				timeUntilDeadline := time.Until(s.writeDeadline)
-				if timeUntilDeadline < waitDuration {
-					waitDuration = timeUntilDeadline
-				}
-			}
-
-			if waitDuration <= 0 {
-				return 0, &timeoutError{}
-			}
-
-			log.Debug().
-				Dur("waitDuration", waitDuration).
-				Msg("peer is choked - waiting before sending (fallback)")
-
-			s.mu.Unlock()
-			time.Sleep(waitDuration)
-			s.mu.Lock()
-
-			// Check deadline after waiting
-			if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
-				return 0, &timeoutError{}
-			}
-
-			// Re-check state after waiting
-			if s.closed {
-				return 0, fmt.Errorf("connection closed")
-			}
-			if s.state != StateEstablished {
-				return 0, fmt.Errorf("connection not established (state: %s)", s.state)
-			}
-		}
+	if err := s.handleChokeWaitLocked(); err != nil {
+		return 0, err
 	}
 
 	total := len(data)
@@ -1189,67 +1289,9 @@ func (s *StreamConn) Write(data []byte) (int, error) {
 		Uint32("startSeq", s.sendSeq).
 		Msg("writing data")
 
-	// Split data into MTU-sized chunks
 	for len(data) > 0 {
-		// Window-based flow control: wait if too many packets in flight
-		// This enforces the congestion window (cwnd) limit per I2P streaming spec
-		// Only enforce if sendCond is initialized (tests may create conn without it)
-		for s.sendCond != nil && s.sentPackets != nil && uint32(len(s.sentPackets)) >= s.cwnd && !s.closed {
-			// Check write deadline before waiting
-			if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
-				return total - len(data), &timeoutError{}
-			}
-
-			log.Debug().
-				Int("inFlight", len(s.sentPackets)).
-				Uint32("cwnd", s.cwnd).
-				Msg("window full - waiting for ACKs")
-
-			// Wait with timeout if deadline is set
-			var timer *time.Timer
-			var done chan struct{}
-			if !s.writeDeadline.IsZero() {
-				timeout := time.Until(s.writeDeadline)
-				if timeout <= 0 {
-					return total - len(data), &timeoutError{}
-				}
-				// Use a timer and done channel for clean goroutine termination
-				timer = time.NewTimer(timeout)
-				done = make(chan struct{})
-				go func() {
-					select {
-					case <-timer.C:
-						s.mu.Lock()
-						if s.sendCond != nil {
-							s.sendCond.Broadcast()
-						}
-						s.mu.Unlock()
-					case <-done:
-						// Early termination - goroutine exits cleanly
-					}
-				}()
-			}
-
-			s.sendCond.Wait()
-
-			// Clean up timer explicitly (not using defer inside loop)
-			if timer != nil {
-				timer.Stop()
-				close(done)
-			}
-
-			// Recheck deadline after waking
-			if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
-				return total - len(data), &timeoutError{}
-			}
-
-			// Re-check connection state after waking
-			if s.closed {
-				return total - len(data), fmt.Errorf("connection closed")
-			}
-			if s.state != StateEstablished {
-				return total - len(data), fmt.Errorf("connection not established (state: %s)", s.state)
-			}
+		if err := s.waitForWindowSpace(total - len(data)); err != nil {
+			return total - len(data), err
 		}
 
 		chunk := data
@@ -1257,27 +1299,10 @@ func (s *StreamConn) Write(data []byte) (int, error) {
 			chunk = data[:mtu]
 		}
 
-		// Create packet with data
-		pkt := &Packet{
-			SendStreamID: s.localStreamID,  // Our stream ID
-			RecvStreamID: s.remoteStreamID, // Peer's stream ID
-			SequenceNum:  s.sendSeq,
-			AckThrough:   s.recvSeq - 1, // Piggyback ACK
-			Flags:        FlagACK,       // Always include ACK flag
-			Payload:      chunk,
+		if err := s.sendDataChunk(chunk); err != nil {
+			return total - len(data), err
 		}
 
-		// Send packet
-		if err := s.sendPacketLocked(pkt); err != nil {
-			return total - len(data), fmt.Errorf("send packet: %w", err)
-		}
-
-		// Increment sequence number by 1 per packet (not per byte)
-		// Per I2P streaming spec, sequence numbers count packets, not bytes
-		s.sendSeq++
-		s.totalBytesSent += uint64(len(chunk))
-
-		// Move to next chunk
 		data = data[len(chunk):]
 	}
 
