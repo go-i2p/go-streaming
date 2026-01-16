@@ -125,6 +125,85 @@ func VerifyPacketSignature(pkt *Packet, crypto *go_i2cp.Crypto) error {
 	return nil
 }
 
+// validateOfflineSignatureInputs checks that all required parameters are non-nil.
+// Returns an error describing which parameter is missing.
+func validateOfflineSignatureInputs(offsig *OfflineSig, dest *go_i2cp.Destination, crypto *go_i2cp.Crypto) error {
+	if offsig == nil {
+		return fmt.Errorf("offline signature is nil")
+	}
+	if dest == nil {
+		return fmt.Errorf("destination is nil")
+	}
+	if crypto == nil {
+		return fmt.Errorf("crypto is nil")
+	}
+	return nil
+}
+
+// checkOfflineSignatureExpiration verifies the offline signature has not expired.
+// Returns an error if current time exceeds the signature's expiration timestamp.
+func checkOfflineSignatureExpiration(offsig *OfflineSig) error {
+	if time.Now().Unix() > int64(offsig.Expires) {
+		return fmt.Errorf("offline signature expired at %d, current time %d",
+			offsig.Expires, time.Now().Unix())
+	}
+	return nil
+}
+
+// buildOfflineSignatureData constructs the byte sequence that was signed by the destination.
+// Format per I2P specification: Expires (4 bytes) + TransientSigType (2 bytes) + TransientPublicKey (variable).
+func buildOfflineSignatureData(offsig *OfflineSig) []byte {
+	toSign := make([]byte, 0, 6+len(offsig.TransientPublicKey))
+
+	// Add expires timestamp (4 bytes, big-endian)
+	var expiresBuf [4]byte
+	binary.BigEndian.PutUint32(expiresBuf[:], offsig.Expires)
+	toSign = append(toSign, expiresBuf[:]...)
+
+	// Add transient signature type (2 bytes, big-endian)
+	var typeBuf [2]byte
+	binary.BigEndian.PutUint16(typeBuf[:], offsig.TransientSigType)
+	toSign = append(toSign, typeBuf[:]...)
+
+	// Add transient public key
+	toSign = append(toSign, offsig.TransientPublicKey...)
+
+	return toSign
+}
+
+// extractSigningPublicKey extracts the Ed25519 signing public key from a destination.
+// Returns the 32-byte signing key or an error if the destination is malformed.
+func extractSigningPublicKey(dest *go_i2cp.Destination) ([]byte, error) {
+	destStream := go_i2cp.NewStream(make([]byte, 0, 512))
+	if err := dest.WriteToMessage(destStream); err != nil {
+		return nil, fmt.Errorf("encode destination: %w", err)
+	}
+	destBytes := destStream.Bytes()
+
+	// For Ed25519 (signature type 7), signing key is 32 bytes at offset 256
+	if len(destBytes) < 256+32 {
+		return nil, fmt.Errorf("destination too short for Ed25519 key extraction")
+	}
+
+	return destBytes[256 : 256+32], nil
+}
+
+// validateDestSignatureFormat checks that the destination signature has valid format.
+// Returns an error if the signature length is wrong or contains all zeros.
+func validateDestSignatureFormat(destSignature []byte) error {
+	if len(destSignature) != 64 {
+		return fmt.Errorf("invalid dest signature length: expected 64, got %d", len(destSignature))
+	}
+
+	// Validate signature is not all zeros (basic sanity check)
+	for _, b := range destSignature {
+		if b != 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("dest signature is all zeros")
+}
+
 // VerifyOfflineSignature verifies an offline signature (LS2) by checking that:
 //  1. The signature has not expired
 //  2. The destination's signing key properly signed the transient key
@@ -148,86 +227,26 @@ func VerifyPacketSignature(pkt *Packet, crypto *go_i2cp.Crypto) error {
 //   - Signature verification fails
 //   - Input parameters are invalid
 func VerifyOfflineSignature(offsig *OfflineSig, dest *go_i2cp.Destination, crypto *go_i2cp.Crypto) error {
-	if offsig == nil {
-		return fmt.Errorf("offline signature is nil")
-	}
-	if dest == nil {
-		return fmt.Errorf("destination is nil")
-	}
-	if crypto == nil {
-		return fmt.Errorf("crypto is nil")
+	if err := validateOfflineSignatureInputs(offsig, dest, crypto); err != nil {
+		return err
 	}
 
-	// Check expiration
-	if time.Now().Unix() > int64(offsig.Expires) {
-		return fmt.Errorf("offline signature expired at %d, current time %d",
-			offsig.Expires, time.Now().Unix())
+	if err := checkOfflineSignatureExpiration(offsig); err != nil {
+		return err
 	}
 
 	// Build the data that was signed by the destination
-	// Format: Expires (4 bytes) + TransientSigType (2 bytes) + TransientPublicKey (variable)
-	toSign := make([]byte, 0, 6+len(offsig.TransientPublicKey))
-
-	// Add expires timestamp (4 bytes, big-endian)
-	var expiresBuf [4]byte
-	binary.BigEndian.PutUint32(expiresBuf[:], offsig.Expires)
-	toSign = append(toSign, expiresBuf[:]...)
-
-	// Add transient signature type (2 bytes, big-endian)
-	var typeBuf [2]byte
-	binary.BigEndian.PutUint16(typeBuf[:], offsig.TransientSigType)
-	toSign = append(toSign, typeBuf[:]...)
-
-	// Add transient public key
-	toSign = append(toSign, offsig.TransientPublicKey...)
-
-	// Verify the destination signed this data
-	// For Ed25519 destinations, we need to extract the signing key and verify
-	// This is a simplified implementation - full implementation would need to
-	// handle all signature types properly
+	toSign := buildOfflineSignatureData(offsig)
 
 	// Extract signing public key from destination
-	// The destination format in I2CP is:
-	// - public_key (for encryption, typically 256 bytes)
-	// - signing_public_key (variable, based on certificate)
-	// - certificate (variable)
-	//
-	// For standard Ed25519 destinations (no certificate), signing key is at offset 256
-	// We'll use go-i2cp's methods to extract this properly
-
-	// Get destination bytes
-	destStream := go_i2cp.NewStream(make([]byte, 0, 512))
-	if err := dest.WriteToMessage(destStream); err != nil {
-		return fmt.Errorf("encode destination: %w", err)
-	}
-	destBytes := destStream.Bytes()
-
-	// For Ed25519 (signature type 7), signing key is 32 bytes at offset 256
-	// This is a simplified approach - full implementation needs proper certificate parsing
-	if len(destBytes) < 256+32 {
-		return fmt.Errorf("destination too short for Ed25519 key extraction")
+	signingPubKey, err := extractSigningPublicKey(dest)
+	if err != nil {
+		return err
 	}
 
-	// Extract signing public key (32 bytes for Ed25519)
-	signingPubKey := destBytes[256 : 256+32]
-
-	// For Ed25519 destinations, validate the signature format
-	// This is a simplified implementation - full cryptographic verification
-	// requires go-i2cp to provide a way to verify with just a public key
-	if len(offsig.DestSignature) != 64 {
-		return fmt.Errorf("invalid dest signature length: expected 64, got %d", len(offsig.DestSignature))
-	}
-
-	// Validate signature is not all zeros (basic sanity check)
-	allZeros := true
-	for _, b := range offsig.DestSignature {
-		if b != 0 {
-			allZeros = false
-			break
-		}
-	}
-	if allZeros {
-		return fmt.Errorf("dest signature is all zeros")
+	// Validate the destination signature format
+	if err := validateDestSignatureFormat(offsig.DestSignature); err != nil {
+		return err
 	}
 
 	// TODO: Full cryptographic verification requires go-i2cp to provide

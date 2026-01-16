@@ -1547,36 +1547,26 @@ func (s *StreamConn) retransmitTimer() {
 	}
 }
 
-// checkRetransmissions scans sent packets for timeouts and retransmits them.
-// Implements exponential backoff per RFC 6298: double RTO on timeout (max 60s).
-// Returns error if max retries (10) exceeded for any packet.
-func (s *StreamConn) checkRetransmissions() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Skip if no RTO calculated yet (need at least one RTT measurement)
-	if s.rto == 0 {
-		return nil
-	}
-
+// findTimedOutPacketsLocked scans sent packets for those exceeding the RTO threshold.
+// Returns a slice of sequence numbers for packets that need retransmission.
+// Caller must hold s.mu.
+func (s *StreamConn) findTimedOutPacketsLocked() []uint32 {
 	now := time.Now()
 	var timedOutSeqs []uint32
 
-	// Find all timed-out packets
 	for seq, info := range s.sentPackets {
-		// Check if packet has timed out
 		if now.Sub(info.sentTime) > s.rto {
 			timedOutSeqs = append(timedOutSeqs, seq)
 		}
 	}
 
-	// Nothing timed out
-	if len(timedOutSeqs) == 0 {
-		return nil
-	}
+	return timedOutSeqs
+}
 
-	// Apply exponential backoff on first timeout
-	// Per RFC 6298: RTO = RTO * 2 (capped at 60 seconds)
+// applyExponentialBackoffLocked doubles the RTO per RFC 6298 (capped at 60s).
+// Logs the backoff with count of timed-out packets.
+// Caller must hold s.mu.
+func (s *StreamConn) applyExponentialBackoffLocked(timedOutCount int) {
 	oldRTO := s.rto
 	s.rto = s.rto * 2
 	if s.rto > 60*time.Second {
@@ -1584,17 +1574,20 @@ func (s *StreamConn) checkRetransmissions() error {
 	}
 
 	log.Debug().
-		Int("count", len(timedOutSeqs)).
+		Int("count", timedOutCount).
 		Dur("oldRTO", oldRTO).
 		Dur("newRTO", s.rto).
 		Msg("packets timed out, applying exponential backoff")
+}
 
-	// Retransmit each timed-out packet
+// retransmitTimedOutPacketsLocked retransmits all timed-out packets.
+// Returns error if any packet exceeds max retries (10 attempts).
+// Caller must hold s.mu.
+func (s *StreamConn) retransmitTimedOutPacketsLocked(timedOutSeqs []uint32) error {
 	for _, seq := range timedOutSeqs {
 		info := s.sentPackets[seq]
 
 		// Check max retries BEFORE incrementing (retransmitPacketLocked will increment)
-		// 10 attempts = 1 original + 9 retransmissions, so check if we're at 10
 		if info.retryCount >= 10 {
 			log.Error().
 				Uint32("seq", seq).
@@ -1609,7 +1602,6 @@ func (s *StreamConn) checkRetransmissions() error {
 				Err(err).
 				Uint32("seq", seq).
 				Msg("timeout retransmission failed")
-			// Continue trying other packets
 			continue
 		}
 
@@ -1621,6 +1613,27 @@ func (s *StreamConn) checkRetransmissions() error {
 	}
 
 	return nil
+}
+
+// checkRetransmissions scans sent packets for timeouts and retransmits them.
+// Implements exponential backoff per RFC 6298: double RTO on timeout (max 60s).
+// Returns error if max retries (10) exceeded for any packet.
+func (s *StreamConn) checkRetransmissions() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Skip if no RTO calculated yet (need at least one RTT measurement)
+	if s.rto == 0 {
+		return nil
+	}
+
+	timedOutSeqs := s.findTimedOutPacketsLocked()
+	if len(timedOutSeqs) == 0 {
+		return nil
+	}
+
+	s.applyExponentialBackoffLocked(len(timedOutSeqs))
+	return s.retransmitTimedOutPacketsLocked(timedOutSeqs)
 }
 
 // inactivityTimer periodically checks for connection inactivity and sends keepalive.
@@ -1910,10 +1923,170 @@ func (s *StreamConn) handleResetLocked(pkt *Packet) error {
 }
 
 // handleAckLocked processes an ACK packet.
+// updateRTTEstimate updates RTT estimates per RFC 6298 algorithm.
+// Must be called with s.mu held.
+func (s *StreamConn) updateRTTEstimate(rtt time.Duration) {
+	s.rtt = rtt
+
+	if s.srtt == 0 {
+		s.srtt = rtt
+		s.rttVariance = rtt / 2
+		log.Debug().
+			Dur("rtt", rtt).
+			Dur("srtt", s.srtt).
+			Dur("rttVar", s.rttVariance).
+			Msg("first RTT measurement")
+		return
+	}
+
+	const alpha = 0.125 // 1/8
+	const beta = 0.25   // 1/4
+
+	var diff time.Duration
+	if s.srtt > rtt {
+		diff = s.srtt - rtt
+	} else {
+		diff = rtt - s.srtt
+	}
+
+	s.rttVariance = time.Duration(float64(s.rttVariance)*(1-beta) + beta*float64(diff))
+	s.srtt = time.Duration(float64(s.srtt)*(1-alpha) + alpha*float64(rtt))
+
+	log.Debug().
+		Dur("rtt", rtt).
+		Dur("srtt", s.srtt).
+		Dur("rttVar", s.rttVariance).
+		Msg("updated RTT estimate")
+}
+
+// calculateRTO calculates and sets the retransmission timeout.
+// Must be called with s.mu held.
+func (s *StreamConn) calculateRTO() {
+	s.rto = s.srtt + 4*s.rttVariance
+
+	const minRTO = 1 * time.Second
+	const maxRTO = 60 * time.Second
+
+	if s.rto < minRTO {
+		s.rto = minRTO
+	}
+	if s.rto > maxRTO {
+		s.rto = maxRTO
+	}
+
+	log.Debug().
+		Dur("rto", s.rto).
+		Msg("calculated RTO")
+}
+
+// measureRTTFromAck measures RTT from an ACKed packet if available.
+// Must be called with s.mu held.
+func (s *StreamConn) measureRTTFromAck(ackThrough uint32) {
+	info, exists := s.sentPackets[ackThrough]
+	if !exists {
+		return
+	}
+
+	rtt := time.Since(info.sentTime)
+	s.updateRTTEstimate(rtt)
+	s.calculateRTO()
+}
+
+// updateCongestionWindow updates the congestion window based on slow start/congestion avoidance.
+// Must be called with s.mu held.
+func (s *StreamConn) updateCongestionWindow() {
+	if s.cwnd < s.ssthresh {
+		oldCwnd := s.cwnd
+		s.cwnd = min(s.cwnd*2, s.ssthresh)
+		s.windowSize = s.cwnd
+
+		log.Debug().
+			Uint32("oldCwnd", oldCwnd).
+			Uint32("newCwnd", s.cwnd).
+			Uint32("ssthresh", s.ssthresh).
+			Msg("slow start: doubled window")
+	} else {
+		oldCwnd := s.cwnd
+		s.cwnd = min(s.cwnd+1, MaxWindowSize)
+		s.windowSize = s.cwnd
+
+		log.Debug().
+			Uint32("oldCwnd", oldCwnd).
+			Uint32("newCwnd", s.cwnd).
+			Uint32("maxWindow", MaxWindowSize).
+			Msg("congestion avoidance: incremented window")
+	}
+}
+
+// handleNACKsLocked processes NACKs and triggers retransmissions.
+// Must be called with s.mu held.
+func (s *StreamConn) handleNACKsLocked(nacks []uint32) {
+	if len(nacks) == 0 {
+		return
+	}
+
+	log.Debug().
+		Int("nackCount", len(nacks)).
+		Msg("processing NACK requests")
+
+	oldCwnd := s.cwnd
+	oldSsthresh := s.ssthresh
+
+	s.ssthresh = max(s.cwnd/2, 2)
+	s.cwnd = s.ssthresh
+	s.windowSize = s.cwnd
+
+	log.Debug().
+		Uint32("oldCwnd", oldCwnd).
+		Uint32("newCwnd", s.cwnd).
+		Uint32("oldSsthresh", oldSsthresh).
+		Uint32("newSsthresh", s.ssthresh).
+		Int("nackCount", len(nacks)).
+		Msg("congestion detected: reduced window due to packet loss")
+
+	for _, nackSeq := range nacks {
+		if err := s.retransmitPacketLocked(nackSeq); err != nil {
+			log.Warn().
+				Err(err).
+				Uint32("seq", nackSeq).
+				Msg("retransmission failed")
+		}
+	}
+}
+
+// handleOptionalDelayLocked processes the choke/unchoke mechanism.
+// Must be called with s.mu held.
+func (s *StreamConn) handleOptionalDelayLocked(pkt *Packet) {
+	if pkt.Flags&FlagDelayRequested == 0 {
+		return
+	}
+
+	if pkt.OptionalDelay > 60000 {
+		s.choked = true
+		s.chokedUntil = time.Now().Add(time.Second)
+		log.Debug().
+			Uint16("delay", pkt.OptionalDelay).
+			Time("chokedUntil", s.chokedUntil).
+			Msg("peer is choked - pausing transmission")
+	} else {
+		wasChoked := s.choked
+		s.choked = false
+		s.chokedUntil = time.Time{}
+		if wasChoked && s.sendCond != nil {
+			s.sendCond.Broadcast()
+		}
+		if pkt.OptionalDelay > 0 {
+			log.Debug().
+				Uint16("delay", pkt.OptionalDelay).
+				Msg("peer requests delay")
+		}
+	}
+}
+
+// handleAckLocked processes an incoming ACK packet.
+// Updates ack tracking, RTT estimates, congestion window, and handles NACKs.
 // Must be called with s.mu held.
 func (s *StreamConn) handleAckLocked(pkt *Packet) error {
-	// Update ackThrough if this ACKs more data
-	// Use wrap-around safe comparison for sequence numbers
 	if seqGreaterThan(pkt.AckThrough, s.ackThrough) {
 		oldAck := s.ackThrough
 		s.ackThrough = pkt.AckThrough
@@ -1921,183 +2094,118 @@ func (s *StreamConn) handleAckLocked(pkt *Packet) error {
 			Uint32("ackThrough", s.ackThrough).
 			Msg("updated ackThrough")
 
-		// RTT measurement and RTO calculation per RFC 6298
-		// Measure RTT from the ACKed packet's sent time
-		// MUST be done BEFORE cleanupAckedPacketsLocked deletes the packet info
-		if info, exists := s.sentPackets[pkt.AckThrough]; exists {
-			// Calculate RTT: time elapsed since packet was sent
-			rtt := time.Since(info.sentTime)
-			s.rtt = rtt // Store last measured RTT
-
-			// RFC 6298 RTT estimation algorithm
-			// First RTT measurement: initialize SRTT and RTTVAR
-			if s.srtt == 0 {
-				s.srtt = rtt
-				s.rttVariance = rtt / 2
-				log.Debug().
-					Dur("rtt", rtt).
-					Dur("srtt", s.srtt).
-					Dur("rttVar", s.rttVariance).
-					Msg("first RTT measurement")
-			} else {
-				// Subsequent measurements: use exponential weighted moving average
-				// RTTVAR = (1 - beta) * RTTVAR + beta * |SRTT - RTT|
-				// SRTT = (1 - alpha) * SRTT + alpha * RTT
-				// where alpha = 1/8, beta = 1/4 per RFC 6298
-
-				const alpha = 0.125 // 1/8
-				const beta = 0.25   // 1/4
-
-				// Calculate absolute difference between SRTT and RTT
-				var diff time.Duration
-				if s.srtt > rtt {
-					diff = s.srtt - rtt
-				} else {
-					diff = rtt - s.srtt
-				}
-
-				// Update RTTVAR and SRTT using exponential moving average
-				s.rttVariance = time.Duration(float64(s.rttVariance)*(1-beta) + beta*float64(diff))
-				s.srtt = time.Duration(float64(s.srtt)*(1-alpha) + alpha*float64(rtt))
-
-				log.Debug().
-					Dur("rtt", rtt).
-					Dur("srtt", s.srtt).
-					Dur("rttVar", s.rttVariance).
-					Msg("updated RTT estimate")
-			}
-
-			// Calculate RTO = SRTT + 4 * RTTVAR
-			// This formula gives a conservative estimate that adapts to variance
-			s.rto = s.srtt + 4*s.rttVariance
-
-			// Enforce RTO bounds per RFC 6298
-			// Minimum: 1 second (prevents aggressive retransmission)
-			// Maximum: 60 seconds (prevents excessive wait)
-			const minRTO = 1 * time.Second
-			const maxRTO = 60 * time.Second
-
-			if s.rto < minRTO {
-				s.rto = minRTO
-			}
-			if s.rto > maxRTO {
-				s.rto = maxRTO
-			}
-
-			log.Debug().
-				Dur("rto", s.rto).
-				Msg("calculated RTO")
-		}
-
-		// Clean up ACKed packets from sent packet tracking
-		// Remove all packets with sequence <= ackThrough
-		// Done AFTER RTT measurement so packet info is available
+		s.measureRTTFromAck(pkt.AckThrough)
 		s.cleanupAckedPacketsLocked(oldAck, pkt.AckThrough)
+		s.updateCongestionWindow()
+	}
 
-		// Slow start / congestion avoidance algorithm
-		// Implements TCP-style congestion control for I2P streaming
-		if s.cwnd < s.ssthresh {
-			// Slow start phase: exponential growth
-			// Double cwnd on each ACK until we reach ssthresh
-			oldCwnd := s.cwnd
-			s.cwnd = min(s.cwnd*2, s.ssthresh)
-			s.windowSize = s.cwnd
+	s.handleNACKsLocked(pkt.NACKs)
+	s.handleOptionalDelayLocked(pkt)
 
-			log.Debug().
-				Uint32("oldCwnd", oldCwnd).
-				Uint32("newCwnd", s.cwnd).
-				Uint32("ssthresh", s.ssthresh).
-				Msg("slow start: doubled window")
-		} else {
-			// Congestion avoidance phase: linear growth
-			// Increment cwnd by 1 on each ACK
-			oldCwnd := s.cwnd
-			s.cwnd = min(s.cwnd+1, MaxWindowSize)
-			s.windowSize = s.cwnd
+	return nil
+}
 
-			log.Debug().
-				Uint32("oldCwnd", oldCwnd).
-				Uint32("newCwnd", s.cwnd).
-				Uint32("maxWindow", MaxWindowSize).
-				Msg("congestion avoidance: incremented window")
+// handleDataLocked processes a data packet with selective ACK (NACK) support.
+// handleBufferFullLocked handles the case when receive buffer is full.
+// Stores the packet for later delivery and sends choke signal.
+// Must be called with s.mu held.
+func (s *StreamConn) handleBufferFullLocked(pkt *Packet, seq uint32) error {
+	log.Warn().Msg("receive buffer full - buffering packet for later")
+	s.outOfOrderPackets[seq] = pkt
+
+	if !s.sendingChoke {
+		if err := s.sendChokeSignalLocked(); err != nil {
+			log.Warn().Err(err).Msg("failed to send choke signal")
 		}
 	}
 
-	// Process NACKs if present - receiver is requesting retransmission
-	if len(pkt.NACKs) > 0 {
-		log.Debug().
-			Int("nackCount", len(pkt.NACKs)).
-			Msg("processing NACK requests")
-
-		// Congestion detection: NACKs indicate packet loss
-		// Implement TCP-style multiplicative decrease response
-		// Per RFC 5681: reduce ssthresh and cwnd on loss detection
-		oldCwnd := s.cwnd
-		oldSsthresh := s.ssthresh
-
-		// Set ssthresh to half of current cwnd, minimum 2 packets
-		// This is the standard TCP congestion avoidance response
-		s.ssthresh = max(s.cwnd/2, 2)
-
-		// Set cwnd to ssthresh (fast recovery without going back to cwnd=1)
-		// This allows the connection to maintain some throughput during recovery
-		s.cwnd = s.ssthresh
-		s.windowSize = s.cwnd
-
-		log.Debug().
-			Uint32("oldCwnd", oldCwnd).
-			Uint32("newCwnd", s.cwnd).
-			Uint32("oldSsthresh", oldSsthresh).
-			Uint32("newSsthresh", s.ssthresh).
-			Int("nackCount", len(pkt.NACKs)).
-			Msg("congestion detected: reduced window due to packet loss")
-
-		for _, nackSeq := range pkt.NACKs {
-			if err := s.retransmitPacketLocked(nackSeq); err != nil {
-				log.Warn().
-					Err(err).
-					Uint32("seq", nackSeq).
-					Msg("retransmission failed")
-				// Continue with other NACKs even if one fails
-			}
-		}
+	if err := s.sendAckLocked(); err != nil {
+		log.Warn().Err(err).Msg("failed to send ACK during buffer full")
 	}
 
-	// Handle optional delay (choking mechanism)
-	// Per I2P streaming spec: OptionalDelay > 60000 indicates choked state
-	if pkt.Flags&FlagDelayRequested != 0 {
-		if pkt.OptionalDelay > 60000 {
-			// Peer is choked - pause sending for a short time
-			s.choked = true
-			s.chokedUntil = time.Now().Add(time.Second)
-			log.Debug().
-				Uint16("delay", pkt.OptionalDelay).
-				Time("chokedUntil", s.chokedUntil).
-				Msg("peer is choked - pausing transmission")
-		} else {
-			// Peer is not choked - clear choke state and wake waiting writers
-			wasChoked := s.choked
-			s.choked = false
-			s.chokedUntil = time.Time{}
-			if wasChoked && s.sendCond != nil {
-				// Wake any writers blocked on choke
-				s.sendCond.Broadcast()
-			}
-			if pkt.OptionalDelay > 0 {
-				log.Debug().
-					Uint16("delay", pkt.OptionalDelay).
-					Msg("peer requests delay")
-			}
+	return nil
+}
+
+// processInSequencePacketLocked processes a packet that arrived in sequence.
+// Must be called with s.mu held.
+func (s *StreamConn) processInSequencePacketLocked(pkt *Packet, seq uint32) error {
+	n, err := s.recvBuf.Write(pkt.Payload)
+	if err != nil {
+		return s.handleBufferFullLocked(pkt, seq)
+	}
+
+	log.Debug().
+		Int("bytes", n).
+		Uint32("seq", s.recvSeq).
+		Msg("buffered payload")
+
+	s.recvSeq++
+	s.totalBytesReceived += uint64(n)
+	s.removeFromNACKListLocked(seq)
+	s.deliverBufferedPacketsLocked()
+
+	if pkt.Flags&FlagACK != 0 && seqGreaterThan(pkt.AckThrough, s.ackThrough) {
+		s.ackThrough = pkt.AckThrough
+	}
+
+	s.manageChokeStateLocked()
+	s.recvCond.Broadcast()
+
+	if !s.sendingChoke || len(s.nackList) > 0 {
+		if err := s.sendAckLocked(); err != nil {
+			log.Warn().Err(err).Msg("failed to send ACK")
 		}
 	}
 
 	return nil
 }
 
-// handleDataLocked processes a data packet with selective ACK (NACK) support.
+// manageChokeStateLocked checks buffer usage and sends choke/unchoke signals.
+// Must be called with s.mu held.
+func (s *StreamConn) manageChokeStateLocked() {
+	currentBufferUsed := s.recvBuf.TotalWritten()
+	if currentBufferUsed == s.lastBufferCheck {
+		return
+	}
+
+	s.lastBufferCheck = currentBufferUsed
+	bufferSize := int64(s.recvBuf.Size())
+	bufferUsage := float64(currentBufferUsed) / float64(bufferSize)
+
+	if bufferUsage > 0.8 && !s.sendingChoke {
+		if err := s.sendChokeSignalLocked(); err != nil {
+			log.Warn().Err(err).Msg("failed to send choke signal")
+		}
+	} else if bufferUsage < 0.3 && s.sendingChoke {
+		if err := s.sendUnchokeSignalLocked(); err != nil {
+			log.Warn().Err(err).Msg("failed to send unchoke signal")
+		}
+	}
+}
+
+// handleOutOfOrderPacketLocked handles a packet that arrived out of order.
+// Must be called with s.mu held.
+func (s *StreamConn) handleOutOfOrderPacketLocked(pkt *Packet, seq uint32) error {
+	log.Debug().
+		Uint32("expected", s.recvSeq).
+		Uint32("got", seq).
+		Msg("out-of-order packet - buffering")
+
+	s.outOfOrderPackets[seq] = pkt
+	s.removeFromNACKListLocked(seq)
+	s.updateNACKListLocked(seq)
+
+	if err := s.sendAckLocked(); err != nil {
+		log.Warn().Err(err).Msg("failed to send ACK with NACKs")
+	}
+
+	return nil
+}
+
+// handleDataLocked processes an incoming data packet.
+// Handles in-sequence, duplicate, and out-of-order packets.
 // Must be called with s.mu held.
 func (s *StreamConn) handleDataLocked(pkt *Packet) error {
-	// Initialize out-of-order tracking on first use
 	if s.outOfOrderPackets == nil {
 		s.outOfOrderPackets = make(map[uint32]*Packet)
 	}
@@ -2106,94 +2214,10 @@ func (s *StreamConn) handleDataLocked(pkt *Packet) error {
 
 	// Case 1: Exact sequence we need - process immediately
 	if seq == s.recvSeq {
-		// Write to receive buffer
-		n, err := s.recvBuf.Write(pkt.Payload)
-		if err != nil {
-			log.Warn().Err(err).Msg("receive buffer full - buffering packet for later")
-			// Buffer full - store packet in out-of-order buffer for later delivery
-			// This prevents data loss when receive buffer is temporarily full
-			s.outOfOrderPackets[seq] = pkt
-
-			// Send choke signal to slow down sender
-			if !s.sendingChoke {
-				if err := s.sendChokeSignalLocked(); err != nil {
-					log.Warn().Err(err).Msg("failed to send choke signal")
-				}
-			}
-
-			// Send ACK with current state - sender will retransmit if needed
-			// when we unchoke after buffer space is freed
-			if err := s.sendAckLocked(); err != nil {
-				log.Warn().Err(err).Msg("failed to send ACK during buffer full")
-			}
-
-			// Return nil - packet is buffered, not lost
-			return nil
-		}
-
-		log.Debug().
-			Int("bytes", n).
-			Uint32("seq", s.recvSeq).
-			Msg("buffered payload")
-
-		// Increment sequence number
-		s.recvSeq++
-		s.totalBytesReceived += uint64(n)
-
-		// Remove this sequence from NACK list if present (we just received it)
-		s.removeFromNACKListLocked(seq)
-
-		// Now try to deliver any buffered packets that are now in sequence
-		s.deliverBufferedPacketsLocked()
-
-		// Update ackThrough if packet has ACK
-		// Use wrap-around safe comparison for sequence numbers
-		if pkt.Flags&FlagACK != 0 && seqGreaterThan(pkt.AckThrough, s.ackThrough) {
-			s.ackThrough = pkt.AckThrough
-		}
-
-		// Check buffer usage and manage choke state
-		// Only check if buffer usage has changed significantly to avoid overhead
-		currentBufferUsed := s.recvBuf.TotalWritten()
-		if currentBufferUsed != s.lastBufferCheck {
-			s.lastBufferCheck = currentBufferUsed
-			bufferSize := int64(s.recvBuf.Size())
-			bufferUsage := float64(currentBufferUsed) / float64(bufferSize)
-
-			// Buffer usage thresholds per I2P streaming best practices:
-			// - Choke at 80% to prevent overflow
-			// - Unchoke at 30% to resume flow with hysteresis
-			if bufferUsage > 0.8 && !s.sendingChoke {
-				// Buffer 80% full - send choke signal
-				if err := s.sendChokeSignalLocked(); err != nil {
-					log.Warn().Err(err).Msg("failed to send choke signal")
-				}
-			} else if bufferUsage < 0.3 && s.sendingChoke {
-				// Buffer below 30% - send unchoke signal
-				if err := s.sendUnchokeSignalLocked(); err != nil {
-					log.Warn().Err(err).Msg("failed to send unchoke signal")
-				}
-			}
-		}
-
-		// Wake up any blocked Read() calls
-		s.recvCond.Broadcast()
-
-		// Send ACK for this packet (with NACKs if any gaps exist)
-		// Skip if we just sent a choke/unchoke signal (already includes ACK)
-		if !s.sendingChoke || len(s.nackList) > 0 {
-			if err := s.sendAckLocked(); err != nil {
-				log.Warn().
-					Err(err).
-					Msg("failed to send ACK")
-			}
-		}
-
-		return nil
+		return s.processInSequencePacketLocked(pkt, seq)
 	}
 
 	// Case 2: Duplicate or old packet - ignore
-	// Use wrap-around safe comparison for sequence numbers
 	if seqLessThan(seq, s.recvSeq) {
 		log.Debug().
 			Uint32("expected", s.recvSeq).
@@ -2203,28 +2227,7 @@ func (s *StreamConn) handleDataLocked(pkt *Packet) error {
 	}
 
 	// Case 3: Future packet - buffer it and track the gap
-	log.Debug().
-		Uint32("expected", s.recvSeq).
-		Uint32("got", seq).
-		Msg("out-of-order packet - buffering")
-
-	// Store the packet
-	s.outOfOrderPackets[seq] = pkt
-
-	// Remove this sequence from NACK list since we just received it
-	s.removeFromNACKListLocked(seq)
-
-	// Track all missing sequences between recvSeq and this packet
-	s.updateNACKListLocked(seq)
-
-	// Send ACK with NACK list to request retransmission
-	if err := s.sendAckLocked(); err != nil {
-		log.Warn().
-			Err(err).
-			Msg("failed to send ACK with NACKs")
-	}
-
-	return nil
+	return s.handleOutOfOrderPacketLocked(pkt, seq)
 }
 
 // deliverBufferedPacketsLocked attempts to deliver contiguous buffered packets.
@@ -2280,14 +2283,17 @@ const MaxNACKs = 255
 // when receiving packets with large sequence gaps (including wrap-around cases).
 // Must be called with s.mu held.
 func (s *StreamConn) updateNACKListLocked(receivedSeq uint32) {
-	// Calculate the sequence gap using wrap-around arithmetic.
-	// This subtraction gives the correct distance even across wrap-around.
-	// For example: receivedSeq=0x00000005, recvSeq=0xFFFFFFFE gives gap=7
+	gap := s.calculateSequenceGapLocked(receivedSeq)
+	s.addMissingSequencesToNACKListLocked(gap)
+}
+
+// calculateSequenceGapLocked computes the sequence gap with wrap-around arithmetic.
+// Returns the gap limited to MaxNACKs to prevent CPU spikes from malicious packets.
+// Caller must hold s.mu.
+func (s *StreamConn) calculateSequenceGapLocked(receivedSeq uint32) uint32 {
+	// Wrap-around arithmetic gives correct distance even across wrap-around
 	gap := receivedSeq - s.recvSeq
 
-	// Limit iterations to prevent CPU spike from malicious or erroneous packets
-	// with very large sequence gaps. Since we can only store MaxNACKs entries anyway,
-	// there's no benefit to iterating beyond that.
 	maxIterations := uint32(MaxNACKs)
 	if gap > maxIterations {
 		log.Debug().
@@ -2296,42 +2302,52 @@ func (s *StreamConn) updateNACKListLocked(receivedSeq uint32) {
 			Uint32("gap", gap).
 			Uint32("maxIterations", maxIterations).
 			Msg("large sequence gap detected, limiting NACK iteration")
-		gap = maxIterations
+		return maxIterations
 	}
 
-	// Add missing sequences to NACK list
+	return gap
+}
+
+// addMissingSequencesToNACKListLocked adds missing sequence numbers to the NACK list.
+// Enforces MaxNACKs limit and skips already-buffered or already-NACKed sequences.
+// Caller must hold s.mu.
+func (s *StreamConn) addMissingSequencesToNACKListLocked(gap uint32) {
 	for i := uint32(0); i < gap; i++ {
 		seq := s.recvSeq + i
 
-		// Enforce maximum NACK list size to prevent unbounded memory growth
-		// Prioritize earlier sequence numbers (already in list) over later ones
 		if len(s.nackList) >= MaxNACKs {
 			log.Debug().
 				Int("nackCount", len(s.nackList)).
 				Uint32("droppedSeq", seq).
 				Msg("NACK list at capacity, dropping new entry")
-			break // Stop adding - we've hit the limit
+			break
 		}
 
-		// Only add if we haven't already buffered this packet
-		if _, buffered := s.outOfOrderPackets[seq]; !buffered {
-			// Check if already in NACK list
-			found := false
-			for _, nack := range s.nackList {
-				if nack == seq {
-					found = true
-					break
-				}
-			}
-			if !found {
-				s.nackList = append(s.nackList, seq)
-				log.Debug().
-					Uint32("seq", seq).
-					Int("nackCount", len(s.nackList)).
-					Msg("added to NACK list")
-			}
+		if s.shouldAddToNACKListLocked(seq) {
+			s.nackList = append(s.nackList, seq)
+			log.Debug().
+				Uint32("seq", seq).
+				Int("nackCount", len(s.nackList)).
+				Msg("added to NACK list")
 		}
 	}
+}
+
+// shouldAddToNACKListLocked checks if a sequence should be added to the NACK list.
+// Returns false if the sequence is already buffered or already in the NACK list.
+// Caller must hold s.mu.
+func (s *StreamConn) shouldAddToNACKListLocked(seq uint32) bool {
+	if _, buffered := s.outOfOrderPackets[seq]; buffered {
+		return false
+	}
+
+	for _, nack := range s.nackList {
+		if nack == seq {
+			return false
+		}
+	}
+
+	return true
 }
 
 // removeFromNACKListLocked removes a sequence number from the NACK list.
