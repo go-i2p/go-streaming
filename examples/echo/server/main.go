@@ -39,18 +39,38 @@ import (
 )
 
 func main() {
-	// Configure logging
+	configureLogging()
+	log.Info().Msg("starting I2P echo server")
+
+	client := createI2CPClient()
+	defer client.Close()
+
+	manager := createStreamManager(client)
+	defer manager.Close()
+
+	startProcessIOLoop(client)
+
+	listener := createListener(manager)
+	defer listener.Close()
+
+	shutdownCtx, shutdownCancel := setupShutdownHandler(listener)
+	defer shutdownCancel()
+
+	runAcceptLoop(shutdownCtx, listener)
+}
+
+// configureLogging sets up the zerolog logger with console output and standard formatting.
+func configureLogging() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
+}
 
-	log.Info().Msg("starting I2P echo server")
-
-	// Create I2CP client with empty callbacks
-	// The StreamManager will register SessionCallbacks for packet routing
+// createI2CPClient creates a new I2CP client and connects to the I2P router.
+// It terminates the program with a fatal error if the connection fails.
+func createI2CPClient() *go_i2cp.Client {
 	client := go_i2cp.NewClient(&go_i2cp.ClientCallBacks{})
 
-	// Connect to I2P router with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -58,32 +78,35 @@ func main() {
 	if err := client.Connect(ctx); err != nil {
 		log.Fatal().Err(err).Msg("failed to connect to I2P router")
 	}
-	defer client.Close()
 
 	log.Info().Msg("connected to I2P router")
+	return client
+}
 
-	// Create StreamManager to handle I2CP callbacks and packet routing
+// createStreamManager creates a stream manager from the I2CP client and starts
+// an I2CP session. It terminates the program with a fatal error on failure.
+func createStreamManager(client *go_i2cp.Client) *streaming.StreamManager {
 	manager, err := streaming.NewStreamManager(client)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create stream manager")
 	}
-	defer manager.Close()
 
-	// Start I2CP session via manager
 	if err := manager.StartSession(context.Background()); err != nil {
 		log.Fatal().Err(err).Msg("failed to start session")
 	}
 
-	// Get our destination address
-	dest := manager.Destination()
-	if dest != nil {
+	if dest := manager.Destination(); dest != nil {
 		log.Info().
 			Str("destination", "session created").
 			Msg("I2CP session ready")
 	}
 
-	// Start I2CP ProcessIO in background to receive messages
-	// This is REQUIRED for the callbacks to work
+	return manager
+}
+
+// startProcessIOLoop starts a background goroutine that continuously processes
+// I2CP I/O operations. This is required for callbacks to function properly.
+func startProcessIOLoop(client *go_i2cp.Client) {
 	go func() {
 		log.Info().Msg("starting I2CP ProcessIO loop")
 		for {
@@ -97,22 +120,29 @@ func main() {
 			}
 		}
 	}()
+}
 
-	// Create streaming listener on port 8080 with default MTU
+// createListener creates a streaming listener on port 8080 with the default MTU.
+// It terminates the program with a fatal error if listener creation fails.
+func createListener(manager *streaming.StreamManager) *streaming.StreamListener {
 	const listenPort = 8080
 	listener, err := streaming.ListenWithManager(manager, listenPort, streaming.DefaultMTU)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create listener")
 	}
-	defer listener.Close()
 
 	log.Info().
 		Str("addr", listener.Addr().String()).
 		Msg("listening for connections")
 
-	// Handle graceful shutdown
+	return listener
+}
+
+// setupShutdownHandler configures graceful shutdown handling for OS signals.
+// It returns a context that will be cancelled on SIGINT or SIGTERM, and a
+// cancel function that should be deferred by the caller.
+func setupShutdownHandler(listener *streaming.StreamListener) (context.Context, context.CancelFunc) {
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
-	defer shutdownCancel()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -124,102 +154,134 @@ func main() {
 		listener.Close()
 	}()
 
-	// Accept loop
+	return shutdownCtx, shutdownCancel
+}
+
+// runAcceptLoop continuously accepts incoming connections and handles them
+// in separate goroutines until the shutdown context is cancelled.
+func runAcceptLoop(shutdownCtx context.Context, listener *streaming.StreamListener) {
 	for {
-		select {
-		case <-shutdownCtx.Done():
+		if shutdownCtx.Err() != nil {
 			log.Info().Msg("shutting down")
 			return
-		default:
 		}
 
-		// Accept returns net.Conn interface
-		conn, err := listener.Accept()
-		if err != nil {
-			if shutdownCtx.Err() != nil {
-				return
-			}
-			log.Error().Err(err).Msg("accept failed")
+		conn := acceptConnection(shutdownCtx, listener)
+		if conn == nil {
 			continue
 		}
 
-		log.Info().
-			Str("remote", conn.RemoteAddr().String()).
-			Msg("accepted connection")
-
-		// Handle connection in goroutine
 		go handleConnection(shutdownCtx, conn)
 	}
 }
 
-// handleConnection echoes data back to the client
-// This demonstrates using the streaming connection as a standard net.Conn
-func handleConnection(ctx context.Context, conn net.Conn) {
-	defer func() {
-		conn.Close()
-		log.Info().
-			Str("remote", conn.RemoteAddr().String()).
-			Msg("connection closed")
-	}()
+// acceptConnection attempts to accept a single connection from the listener.
+// It returns nil if the shutdown context is cancelled or if accept fails.
+func acceptConnection(shutdownCtx context.Context, listener *streaming.StreamListener) net.Conn {
+	conn, err := listener.Accept()
+	if err != nil {
+		if shutdownCtx.Err() != nil {
+			return nil
+		}
+		log.Error().Err(err).Msg("accept failed")
+		return nil
+	}
 
-	// Set read timeout to detect inactive connections
+	log.Info().
+		Str("remote", conn.RemoteAddr().String()).
+		Msg("accepted connection")
+
+	return conn
+}
+
+// handleConnection echoes data back to the client.
+// This demonstrates using the streaming connection as a standard net.Conn.
+func handleConnection(ctx context.Context, conn net.Conn) {
+	defer closeConnection(conn)
+
 	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 
 	buf := make([]byte, 4096)
 	totalBytes := 0
 
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		// Read data from client
-		n, err := conn.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				log.Info().
-					Str("remote", conn.RemoteAddr().String()).
-					Int("total_bytes", totalBytes).
-					Msg("client closed connection")
-				return
-			}
-			log.Error().
-				Err(err).
-				Str("remote", conn.RemoteAddr().String()).
-				Msg("read error")
+		if ctx.Err() != nil {
 			return
 		}
 
+		n, done := readFromClient(conn, buf, totalBytes)
+		if done {
+			return
+		}
 		if n == 0 {
 			continue
 		}
 
 		totalBytes += n
+		logReceivedData(conn, buf[:n])
 
-		log.Debug().
-			Str("remote", conn.RemoteAddr().String()).
-			Int("bytes", n).
-			Str("preview", fmt.Sprintf("%.50s", buf[:n])).
-			Msg("received data")
-
-		// Echo data back to client
-		written, err := conn.Write(buf[:n])
-		if err != nil {
-			log.Error().
-				Err(err).
-				Str("remote", conn.RemoteAddr().String()).
-				Msg("write error")
+		if !echoToClient(conn, buf[:n]) {
 			return
 		}
 
-		log.Debug().
-			Str("remote", conn.RemoteAddr().String()).
-			Int("bytes", written).
-			Msg("echoed data")
-
-		// Reset read deadline after successful read/write
 		conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 	}
+}
+
+// closeConnection closes the connection and logs the closure.
+func closeConnection(conn net.Conn) {
+	conn.Close()
+	log.Info().
+		Str("remote", conn.RemoteAddr().String()).
+		Msg("connection closed")
+}
+
+// readFromClient reads data from the client connection into the buffer.
+// It returns the number of bytes read and a boolean indicating if the connection should terminate.
+func readFromClient(conn net.Conn, buf []byte, totalBytes int) (int, bool) {
+	n, err := conn.Read(buf)
+	if err != nil {
+		if err == io.EOF {
+			log.Info().
+				Str("remote", conn.RemoteAddr().String()).
+				Int("total_bytes", totalBytes).
+				Msg("client closed connection")
+			return 0, true
+		}
+		log.Error().
+			Err(err).
+			Str("remote", conn.RemoteAddr().String()).
+			Msg("read error")
+		return 0, true
+	}
+	return n, false
+}
+
+// logReceivedData logs debug information about received data.
+func logReceivedData(conn net.Conn, data []byte) {
+	log.Debug().
+		Str("remote", conn.RemoteAddr().String()).
+		Int("bytes", len(data)).
+		Str("preview", fmt.Sprintf("%.50s", data)).
+		Msg("received data")
+}
+
+// echoToClient writes data back to the client connection.
+// It returns true if the write was successful, false otherwise.
+func echoToClient(conn net.Conn, data []byte) bool {
+	written, err := conn.Write(data)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("remote", conn.RemoteAddr().String()).
+			Msg("write error")
+		return false
+	}
+
+	log.Debug().
+		Str("remote", conn.RemoteAddr().String()).
+		Int("bytes", written).
+		Msg("echoed data")
+
+	return true
 }
