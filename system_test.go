@@ -1,3 +1,5 @@
+//go:build system
+
 // System integration tests for go-streaming
 //
 // These tests require a FULLY OPERATIONAL I2P router with I2CP enabled on localhost:7654.
@@ -268,8 +270,6 @@ func TestSystem_EchoServerClient(t *testing.T) {
 
 	serverManager := createTestManager(t, serverClient)
 	defer serverManager.Close()
-
-	startProcessIO(t, serverClient, serverCtx)
 
 	// Create listener
 	listener, err := ListenWithManager(serverManager, 9000, DefaultMTU)
