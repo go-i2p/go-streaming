@@ -783,45 +783,34 @@ func getSignatureTypeFromDestination(dest *go_i2cp.Destination) int {
 		return SignatureTypeEd25519
 	}
 
-	// Serialize destination to calculate its size
-	// Different signature types result in different destination sizes
+	destSize := getDestinationSize(dest)
+	if destSize < 0 {
+		return SignatureTypeEd25519
+	}
+
+	return inferSignatureTypeFromSize(destSize)
+}
+
+// getDestinationSize serializes the destination and returns its size.
+// Returns -1 if serialization fails.
+func getDestinationSize(dest *go_i2cp.Destination) int {
 	stream := go_i2cp.NewStream(make([]byte, 0, 512))
-	err := dest.WriteToMessage(stream)
-	if err != nil {
-		// If serialization fails, assume Ed25519 (most common)
-		return SignatureTypeEd25519
+	if err := dest.WriteToMessage(stream); err != nil {
+		return -1
 	}
+	return len(stream.Bytes())
+}
 
-	destSize := len(stream.Bytes())
-
-	// Heuristic-based detection:
-	// - Ed25519 destinations are typically 387-391 bytes
-	// - DSA destinations are typically 387 bytes (128-byte signing key)
-	// - ECDSA/RSA destinations vary based on key size
-	//
-	// Since go-i2cp only creates Ed25519 destinations, and that's the default
-	// for Java I2P since 0.9.15, we default to Ed25519.
-	//
-	// Future enhancement: Parse the actual certificate bytes to read the signature type.
-	// This would require:
-	//   1. Skip 256 bytes (ElGamal encryption key)
-	//   2. Read certificate type (1 byte)
-	//   3. Read certificate length (2 bytes)
-	//   4. For KeyCertificate (type 5), read signing key type (2 bytes at start of payload)
-	//
-	// For now, size-based heuristic is sufficient for Ed25519 detection.
-	// When parsing packets from Java I2P with other signature types, the signature
-	// length will be explicitly provided in the packet's option data.
-
+// inferSignatureTypeFromSize uses size-based heuristics to determine signature type.
+// Ed25519 destinations are typically 387-391 bytes. DSA destinations are ~387 bytes.
+// Since go-i2cp only creates Ed25519 destinations (default since Java I2P 0.9.15),
+// we default to Ed25519. When receiving packets from Java I2P with other signature
+// types, the signature length is explicitly provided in the packet's option data.
+func inferSignatureTypeFromSize(destSize int) int {
+	// Standard size range for Ed25519 or DSA destinations
 	if destSize >= 385 && destSize <= 395 {
-		// Standard size range for Ed25519 or DSA destinations
-		// Default to Ed25519 as it's more common
 		return SignatureTypeEd25519
 	}
-
 	// For non-standard sizes, default to Ed25519
-	// In practice, when receiving packets from Java I2P with different signature types,
-	// the signature will be in the packet's option data with its actual length,
-	// so this function is primarily used for allocating space when creating packets.
 	return SignatureTypeEd25519
 }

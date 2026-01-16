@@ -425,59 +425,64 @@ func (sm *StreamManager) processPackets() {
 //  2. Existing connection (for established connections)
 //  3. Unknown destination (drop packet or send RESET)
 func (sm *StreamManager) dispatchPacket(incoming *incomingPacket) {
-	// Unmarshal streaming packet
+	pkt, err := sm.unmarshalIncomingPacket(incoming)
+	if err != nil {
+		return
+	}
+
+	sm.logDispatchingPacket(pkt, incoming)
+
+	if sm.isSynPacket(pkt) {
+		sm.handleSynPacket(pkt, incoming)
+		return
+	}
+
+	sm.routeToConnection(pkt, incoming)
+}
+
+// unmarshalIncomingPacket unmarshals the streaming packet from incoming payload.
+func (sm *StreamManager) unmarshalIncomingPacket(incoming *incomingPacket) (*Packet, error) {
 	pkt := &Packet{}
 	if err := pkt.Unmarshal(incoming.payload); err != nil {
-		log.Warn().
-			Err(err).
-			Uint16("destPort", incoming.destPort).
-			Msg("failed to unmarshal streaming packet")
-		return
+		log.Warn().Err(err).Uint16("destPort", incoming.destPort).Msg("failed to unmarshal streaming packet")
+		return nil, err
 	}
+	return pkt, nil
+}
 
+// logDispatchingPacket logs debug information about a dispatched packet.
+func (sm *StreamManager) logDispatchingPacket(pkt *Packet, incoming *incomingPacket) {
 	log.Debug().
-		Uint32("seq", pkt.SequenceNum).
-		Uint32("ack", pkt.AckThrough).
-		Uint16("flags", pkt.Flags).
-		Uint16("srcPort", incoming.srcPort).
-		Uint16("destPort", incoming.destPort).
-		Int("payload", len(pkt.Payload)).
-		Msg("dispatching packet")
+		Uint32("seq", pkt.SequenceNum).Uint32("ack", pkt.AckThrough).Uint16("flags", pkt.Flags).
+		Uint16("srcPort", incoming.srcPort).Uint16("destPort", incoming.destPort).
+		Int("payload", len(pkt.Payload)).Msg("dispatching packet")
+}
 
-	// Check if this is a SYN packet for a new connection
-	if pkt.Flags&FlagSYN != 0 && pkt.Flags&FlagACK == 0 {
-		// Look for listener on this port
-		if listenerIface, ok := sm.listeners.Load(incoming.destPort); ok {
-			listener := listenerIface.(*StreamListener)
-			listener.handleIncomingSYN(pkt, incoming.srcPort, incoming.srcDest)
-			return
-		}
+// isSynPacket checks if the packet is a SYN packet for a new connection.
+func (sm *StreamManager) isSynPacket(pkt *Packet) bool {
+	return pkt.Flags&FlagSYN != 0 && pkt.Flags&FlagACK == 0
+}
 
-		log.Debug().
-			Uint16("destPort", incoming.destPort).
-			Msg("SYN packet for port with no listener - sending RESET")
-		// Send RESET to notify peer that no listener exists on this port
-		sm.sendResetPacket(incoming.srcDest, pkt.SendStreamID, incoming.destPort, incoming.srcPort)
+// handleSynPacket handles a SYN packet by routing to a listener or sending RESET.
+func (sm *StreamManager) handleSynPacket(pkt *Packet, incoming *incomingPacket) {
+	if listenerIface, ok := sm.listeners.Load(incoming.destPort); ok {
+		listener := listenerIface.(*StreamListener)
+		listener.handleIncomingSYN(pkt, incoming.srcPort, incoming.srcDest)
 		return
 	}
+	log.Debug().Uint16("destPort", incoming.destPort).Msg("SYN packet for port with no listener - sending RESET")
+	sm.sendResetPacket(incoming.srcDest, pkt.SendStreamID, incoming.destPort, incoming.srcPort)
+}
 
-	// Route to existing connection
-	key := connKey{
-		localPort:  incoming.destPort,
-		remotePort: incoming.srcPort,
-	}
-
+// routeToConnection routes a packet to an existing connection or sends RESET.
+func (sm *StreamManager) routeToConnection(pkt *Packet, incoming *incomingPacket) {
+	key := connKey{localPort: incoming.destPort, remotePort: incoming.srcPort}
 	if connIface, ok := sm.connections.Load(key); ok {
 		conn := connIface.(*StreamConn)
 		conn.handleIncomingPacket(pkt)
 		return
 	}
-
-	log.Debug().
-		Uint16("localPort", incoming.destPort).
-		Uint16("remotePort", incoming.srcPort).
-		Msg("packet for unknown connection - sending RESET")
-	// Send RESET to notify peer that this connection doesn't exist
+	log.Debug().Uint16("localPort", incoming.destPort).Uint16("remotePort", incoming.srcPort).Msg("packet for unknown connection - sending RESET")
 	sm.sendResetPacket(incoming.srcDest, pkt.SendStreamID, incoming.destPort, incoming.srcPort)
 }
 

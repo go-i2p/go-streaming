@@ -464,15 +464,23 @@ func createConnectionStruct(session *go_i2cp.Session, manager *StreamManager, de
 
 // performHandshake executes the three-way handshake for a connection.
 func performHandshake(conn *StreamConn, timeout time.Duration) error {
-	// Send SYN packet
 	if err := conn.sendSYN(); err != nil {
 		return fmt.Errorf("send SYN: %w", err)
 	}
-
-	// Transition to SYN_SENT state
 	conn.setState(StateSynSent)
 
-	// Wait for SYN-ACK with timeout
+	if err := completeHandshake(conn, timeout); err != nil {
+		return err
+	}
+
+	conn.setState(StateEstablished)
+	startConnectionGoroutines(conn)
+	logConnectionEstablished(conn)
+	return nil
+}
+
+// completeHandshake waits for SYN-ACK and sends final ACK.
+func completeHandshake(conn *StreamConn, timeout time.Duration) error {
 	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), timeout)
 	defer timeoutCancel()
 
@@ -480,34 +488,28 @@ func performHandshake(conn *StreamConn, timeout time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("wait for SYN-ACK: %w", err)
 	}
-
-	// Process SYN-ACK: extract remote ISN and MTU
 	conn.processSynAck(synAck)
 
-	// Send final ACK to complete handshake
 	if err := conn.sendACK(); err != nil {
 		return fmt.Errorf("send ACK: %w", err)
 	}
+	return nil
+}
 
-	// Transition to ESTABLISHED state
-	conn.setState(StateEstablished)
-
-	// Start receive loop goroutine
+// startConnectionGoroutines starts the receive loop and timer goroutines.
+func startConnectionGoroutines(conn *StreamConn) {
 	go conn.receiveLoop()
-
-	// Start retransmission timer goroutine for timeout-based retransmission
 	go conn.retransmitTimer()
-
-	// Start inactivity timer goroutine for keepalive detection
 	go conn.inactivityTimer()
+}
 
+// logConnectionEstablished logs info about the established connection.
+func logConnectionEstablished(conn *StreamConn) {
 	log.Info().
 		Str("state", conn.state.String()).
 		Uint16("negotiatedMTU", conn.getNegotiatedMTU()).
 		Dur("rtt", conn.rtt).
 		Msg("connection established")
-
-	return nil
 }
 
 // sendSYN sends a SYN packet to initiate the handshake.
@@ -646,45 +648,36 @@ func (s *StreamConn) processSynAck(pkt *Packet) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Extract remote ISN
-	s.recvSeq = pkt.SequenceNum + 1 // Next expected sequence
-
-	// Extract remote stream ID from SYN-ACK
-	// In SYN-ACK, SendStreamID is the peer's stream ID
+	s.recvSeq = pkt.SequenceNum + 1
 	s.remoteStreamID = pkt.SendStreamID
-
-	// Initialize ackThrough from the SYN-ACK's AckThrough field.
-	// This is critical: the SYN-ACK acknowledges our SYN (with AckThrough = our ISN).
-	// We must initialize ackThrough here so that subsequent ACK comparisons
-	// using seqGreaterThan() work correctly. Without this, ackThrough stays at 0
-	// and seqGreaterThan(largeSeqNum, 0) can return false due to signed int32 overflow
-	// in the wrap-around comparison logic.
 	s.ackThrough = pkt.AckThrough
+	s.extractRemoteMTUFromSynAck(pkt)
+	s.logSynAckProcessed(pkt)
+}
 
-	// MTU negotiation: extract remote MTU from SYN-ACK if present
-	// Per I2P spec, server includes MaxPacketSize in SYN-ACK with FlagMaxPacketSizeIncluded flag
+// extractRemoteMTUFromSynAck extracts and negotiates MTU from the SYN-ACK packet.
+// Per I2P spec, server includes MaxPacketSize in SYN-ACK with FlagMaxPacketSizeIncluded flag.
+func (s *StreamConn) extractRemoteMTUFromSynAck(pkt *Packet) {
 	if pkt.Flags&FlagMaxPacketSizeIncluded != 0 && pkt.MaxPacketSize > 0 {
 		s.remoteMTU = pkt.MaxPacketSize
 		log.Debug().
-			Uint16("remoteMTU", s.remoteMTU).
-			Uint16("localMTU", s.localMTU).
+			Uint16("remoteMTU", s.remoteMTU).Uint16("localMTU", s.localMTU).
 			Uint16("negotiatedMTU", s.getNegotiatedMTULocked()).
 			Msg("MTU negotiated from SYN-ACK")
 	} else {
 		s.remoteMTU = DefaultMTU
 		log.Warn().
-			Uint16("localMTU", s.localMTU).
-			Uint16("negotiatedMTU", s.getNegotiatedMTULocked()).
+			Uint16("localMTU", s.localMTU).Uint16("negotiatedMTU", s.getNegotiatedMTULocked()).
 			Msg("SYN-ACK missing MTU flag/value, using default")
 	}
+}
 
+// logSynAckProcessed logs debug information about the processed SYN-ACK.
+func (s *StreamConn) logSynAckProcessed(pkt *Packet) {
 	log.Debug().
-		Uint32("remoteSeq", pkt.SequenceNum).
-		Uint32("ourAck", s.recvSeq).
-		Uint32("remoteStreamID", s.remoteStreamID).
-		Uint16("remoteMTU", s.remoteMTU).
-		Uint32("ackThrough", s.ackThrough).
-		Msg("processed SYN-ACK")
+		Uint32("remoteSeq", pkt.SequenceNum).Uint32("ourAck", s.recvSeq).
+		Uint32("remoteStreamID", s.remoteStreamID).Uint16("remoteMTU", s.remoteMTU).
+		Uint32("ackThrough", s.ackThrough).Msg("processed SYN-ACK")
 }
 
 // sendACK sends the final ACK to complete the three-way handshake.
@@ -980,8 +973,13 @@ func (l *StreamListener) createIncomingConnection(synPkt *Packet, remotePort uin
 		return nil, fmt.Errorf("create receive buffer: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	conn := l.initConnectionState(synPkt, remotePort, peerDest, isn, localStreamID, recvBuf)
+	return conn, nil
+}
 
+// initConnectionState creates a new StreamConn with initialized state from handshake parameters.
+func (l *StreamListener) initConnectionState(synPkt *Packet, remotePort uint16, peerDest *go_i2cp.Destination, isn, localStreamID uint32, recvBuf *circbuf.Buffer) *StreamConn {
+	ctx, cancel := context.WithCancel(context.Background())
 	conn := &StreamConn{
 		manager:           l.manager,
 		session:           l.session,
@@ -1013,8 +1011,7 @@ func (l *StreamListener) createIncomingConnection(synPkt *Packet, remotePort uin
 	}
 	conn.recvCond = sync.NewCond(&conn.mu)
 	conn.sendCond = sync.NewCond(&conn.mu)
-
-	return conn, nil
+	return conn
 }
 
 // queueConnectionForAccept queues a connection for Accept() and starts the receive loop.
@@ -1096,17 +1093,36 @@ func (s *StreamConn) sendSynAck() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	pkt := &Packet{
-		SendStreamID:    s.localStreamID,  // Our stream ID
-		RecvStreamID:    s.remoteStreamID, // Peer's stream ID
-		SequenceNum:     s.sendSeq,
-		AckThrough:      s.recvSeq - 1, // ACK the SYN
-		Flags:           FlagSYN | FlagACK | FlagMaxPacketSizeIncluded | FlagSignatureIncluded | FlagFromIncluded,
-		MaxPacketSize:   s.localMTU,              // Advertise our MTU
-		FromDestination: s.session.Destination(), // Include our destination
+	pkt := s.buildSynAckPacket()
+
+	if err := s.signSynAckPacket(pkt); err != nil {
+		return err
 	}
 
-	// Sign the SYN-ACK packet
+	if err := s.transmitSynAckPacket(pkt); err != nil {
+		return err
+	}
+
+	s.logSentSynAck(pkt)
+	s.sendSeq++
+	return nil
+}
+
+// buildSynAckPacket creates a SYN-ACK packet with appropriate flags and options.
+func (s *StreamConn) buildSynAckPacket() *Packet {
+	return &Packet{
+		SendStreamID:    s.localStreamID,
+		RecvStreamID:    s.remoteStreamID,
+		SequenceNum:     s.sendSeq,
+		AckThrough:      s.recvSeq - 1,
+		Flags:           FlagSYN | FlagACK | FlagMaxPacketSizeIncluded | FlagSignatureIncluded | FlagFromIncluded,
+		MaxPacketSize:   s.localMTU,
+		FromDestination: s.session.Destination(),
+	}
+}
+
+// signSynAckPacket signs the SYN-ACK packet using the session's signing key pair.
+func (s *StreamConn) signSynAckPacket(pkt *Packet) error {
 	keyPair, err := s.session.SigningKeyPair()
 	if err != nil {
 		return fmt.Errorf("get signing key pair: %w", err)
@@ -1114,29 +1130,28 @@ func (s *StreamConn) sendSynAck() error {
 	if err := SignPacket(pkt, keyPair); err != nil {
 		return fmt.Errorf("sign SYN-ACK: %w", err)
 	}
+	return nil
+}
 
+// transmitSynAckPacket marshals and sends the SYN-ACK packet via I2CP.
+func (s *StreamConn) transmitSynAckPacket(pkt *Packet) error {
 	data, err := pkt.Marshal()
 	if err != nil {
 		return fmt.Errorf("marshal SYN-ACK: %w", err)
 	}
-
 	stream := go_i2cp.NewStream(data)
-	err = s.session.SendMessage(s.dest, 6, s.localPort, s.remotePort, stream, 0)
-	if err != nil {
+	if err := s.session.SendMessage(s.dest, 6, s.localPort, s.remotePort, stream, 0); err != nil {
 		return fmt.Errorf("send SYN-ACK message: %w", err)
 	}
-
-	log.Debug().
-		Uint32("seq", pkt.SequenceNum).
-		Uint32("ack", pkt.AckThrough).
-		Uint16("flags", pkt.Flags).
-		Uint16("localMTU", s.localMTU).
-		Msg("sent SYN-ACK")
-
-	// SYN-ACK consumes one sequence number - increment for next packet
-	s.sendSeq++
-
 	return nil
+}
+
+// logSentSynAck logs debug information about the sent SYN-ACK packet.
+func (s *StreamConn) logSentSynAck(pkt *Packet) {
+	log.Debug().
+		Uint32("seq", pkt.SequenceNum).Uint32("ack", pkt.AckThrough).
+		Uint16("flags", pkt.Flags).Uint16("localMTU", s.localMTU).
+		Msg("sent SYN-ACK")
 }
 
 // validateWriteStateLocked checks if the connection is in a valid state for writing.
@@ -1822,50 +1837,38 @@ func (s *StreamConn) processPacket(pkt *Packet) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Update last activity time for inactivity detection
 	s.lastActivity = time.Now()
+	s.logProcessingPacket(pkt)
+	return s.dispatchPacketByFlags(pkt)
+}
 
+// logProcessingPacket logs debug information about the packet being processed.
+func (s *StreamConn) logProcessingPacket(pkt *Packet) {
 	log.Debug().
-		Uint32("seq", pkt.SequenceNum).
-		Uint32("ack", pkt.AckThrough).
-		Uint16("flags", pkt.Flags).
-		Int("payload", len(pkt.Payload)).
-		Str("state", s.state.String()).
-		Msg("processing packet")
+		Uint32("seq", pkt.SequenceNum).Uint32("ack", pkt.AckThrough).
+		Uint16("flags", pkt.Flags).Int("payload", len(pkt.Payload)).
+		Str("state", s.state.String()).Msg("processing packet")
+}
 
-	// Handle based on flags and state
-	// Note: Order matters! More specific cases first.
+// dispatchPacketByFlags routes the packet to the appropriate handler based on flags.
+// Note: Order matters! More specific cases first.
+func (s *StreamConn) dispatchPacketByFlags(pkt *Packet) error {
 	switch {
 	case pkt.Flags&FlagSYN != 0 && pkt.Flags&FlagACK != 0:
-		// SYN-ACK packet (client side handshake response)
 		return s.handleSynAckLocked(pkt)
-
 	case pkt.Flags&FlagACK != 0 && s.state == StateSynRcvd:
-		// Final ACK of three-way handshake (server side)
 		return s.handleFinalAckLocked(pkt)
-
 	case pkt.Flags&FlagCLOSE != 0:
-		// CLOSE packet
 		return s.handleCloseLocked(pkt)
-
 	case pkt.Flags&FlagRESET != 0:
-		// RESET packet
 		return s.handleResetLocked(pkt)
-
 	case len(pkt.Payload) > 0:
-		// Data packet (may also have ACK flag - handled in handleDataLocked)
 		return s.handleDataLocked(pkt)
-
 	case pkt.Flags&FlagACK != 0:
-		// Pure ACK packet (no data)
 		return s.handleAckLocked(pkt)
-
 	default:
-		log.Debug().
-			Uint16("flags", pkt.Flags).
-			Msg("packet with no recognized flags")
+		log.Debug().Uint16("flags", pkt.Flags).Msg("packet with no recognized flags")
 	}
-
 	return nil
 }
 
@@ -2657,46 +2660,57 @@ func (s *StreamConn) sendPacketLocked(pkt *Packet) error {
 		return fmt.Errorf("marshal packet: %w", err)
 	}
 
-	// Track data packets for potential retransmission on NACK
-	// Only track packets with payload (data packets), not control packets
-	if len(pkt.Payload) > 0 {
-		if s.sentPackets == nil {
-			s.sentPackets = make(map[uint32]*sentPacket)
-		}
-		s.sentPackets[pkt.SequenceNum] = &sentPacket{
-			data:       data,
-			sentTime:   time.Now(),
-			retryCount: 0,
-		}
+	s.trackPacketForRetransmission(pkt, data)
 
-		log.Debug().
-			Uint32("seq", pkt.SequenceNum).
-			Int("tracked", len(s.sentPackets)).
-			Msg("tracking sent packet for retransmission")
+	if err := s.sendViaI2CP(data); err != nil {
+		return err
 	}
 
-	// Send packet via I2CP
+	s.lastActivity = time.Now()
+	s.logSentPacket(pkt)
+	return nil
+}
+
+// trackPacketForRetransmission stores data packets for potential retransmission on NACK.
+// Only tracks packets with payload (data packets), not control packets.
+func (s *StreamConn) trackPacketForRetransmission(pkt *Packet, data []byte) {
+	if len(pkt.Payload) == 0 {
+		return
+	}
+	if s.sentPackets == nil {
+		s.sentPackets = make(map[uint32]*sentPacket)
+	}
+	s.sentPackets[pkt.SequenceNum] = &sentPacket{
+		data:       data,
+		sentTime:   time.Now(),
+		retryCount: 0,
+	}
+	log.Debug().
+		Uint32("seq", pkt.SequenceNum).
+		Int("tracked", len(s.sentPackets)).
+		Msg("tracking sent packet for retransmission")
+}
+
+// sendViaI2CP sends marshaled packet data via the I2CP session.
+func (s *StreamConn) sendViaI2CP(data []byte) error {
 	if s.session == nil {
 		return fmt.Errorf("cannot send packet: no I2CP session")
 	}
-
 	stream := go_i2cp.NewStream(data)
-	err = s.session.SendMessage(s.dest, 6, s.localPort, s.remotePort, stream, 0)
-	if err != nil {
+	if err := s.session.SendMessage(s.dest, 6, s.localPort, s.remotePort, stream, 0); err != nil {
 		return fmt.Errorf("send message: %w", err)
 	}
+	return nil
+}
 
-	// Update last activity time for inactivity detection
-	s.lastActivity = time.Now()
-
+// logSentPacket logs debug information about a sent packet.
+func (s *StreamConn) logSentPacket(pkt *Packet) {
 	log.Debug().
 		Uint32("seq", pkt.SequenceNum).
 		Uint32("ack", pkt.AckThrough).
 		Uint16("flags", pkt.Flags).
 		Int("payload", len(pkt.Payload)).
 		Msg("sent packet")
-
-	return nil
 }
 
 // getNegotiatedMTULocked returns the negotiated MTU.
