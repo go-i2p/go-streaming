@@ -39,23 +39,47 @@ import (
 )
 
 func main() {
-	// Configure logging
+	configureLogging()
+	log.Info().Msg("starting I2P echo client")
+
+	serverDestB64 := parseServerDestination()
+
+	client := createI2CPClient()
+	defer client.Close()
+
+	manager := createStreamManager(client)
+	defer manager.Close()
+
+	startProcessIOLoop(client)
+
+	dest := parseDestinationFromBase64(serverDestB64)
+	conn := connectToServer(manager, dest)
+	defer conn.Close()
+
+	runEchoTestOrFail(conn)
+}
+
+// configureLogging sets up the zerolog logger with console output and standard formatting.
+func configureLogging() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
+}
 
-	log.Info().Msg("starting I2P echo client")
-
-	// Parse server destination from command line
+// parseServerDestination parses the server destination from command line arguments.
+// It terminates the program with a fatal error if no destination is provided.
+func parseServerDestination() string {
 	if len(os.Args) < 2 {
 		log.Fatal().Msg("usage: client <server-destination-base64>")
 	}
-	serverDestB64 := os.Args[1]
+	return os.Args[1]
+}
 
-	// Create I2CP client with empty callbacks
+// createI2CPClient creates a new I2CP client and connects to the I2P router.
+// It terminates the program with a fatal error if the connection fails.
+func createI2CPClient() *go_i2cp.Client {
 	client := go_i2cp.NewClient(&go_i2cp.ClientCallBacks{})
 
-	// Connect to I2P router with timeout
 	connCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -63,24 +87,29 @@ func main() {
 	if err := client.Connect(connCtx); err != nil {
 		log.Fatal().Err(err).Msg("failed to connect to I2P router")
 	}
-	defer client.Close()
 
 	log.Info().Msg("connected to I2P router")
+	return client
+}
 
-	// Create StreamManager to handle I2CP callbacks and packet routing
+// createStreamManager creates a stream manager from the I2CP client and starts
+// an I2CP session. It terminates the program with a fatal error on failure.
+func createStreamManager(client *go_i2cp.Client) *streaming.StreamManager {
 	manager, err := streaming.NewStreamManager(client)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create stream manager")
 	}
-	defer manager.Close()
 
-	// Start I2CP session via manager
 	if err := manager.StartSession(context.Background()); err != nil {
 		log.Fatal().Err(err).Msg("failed to start session")
 	}
 
-	// Start I2CP ProcessIO in background to receive messages
-	// This is REQUIRED for the callbacks to work
+	return manager
+}
+
+// startProcessIOLoop starts a background goroutine that continuously processes
+// I2CP I/O operations. This is required for callbacks to function properly.
+func startProcessIOLoop(client *go_i2cp.Client) {
 	go func() {
 		log.Info().Msg("starting I2CP ProcessIO loop")
 		for {
@@ -94,18 +123,25 @@ func main() {
 			}
 		}
 	}()
+}
 
-	// Parse server destination from base64
+// parseDestinationFromBase64 parses an I2P destination from its base64 representation.
+// It terminates the program with a fatal error if parsing fails.
+func parseDestinationFromBase64(destB64 string) *go_i2cp.Destination {
 	log.Info().Msg("parsing server destination")
 	crypto := go_i2cp.NewCrypto()
-	dest, err := go_i2cp.NewDestinationFromBase64(serverDestB64, crypto)
+	dest, err := go_i2cp.NewDestinationFromBase64(destB64, crypto)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to parse server destination")
 	}
+	return dest
+}
 
-	// Connect to remote server
-	const localPort = 0     // Use ephemeral port
-	const remotePort = 8080 // Server's listening port
+// connectToServer establishes a streaming connection to the remote server.
+// It terminates the program with a fatal error if the connection fails.
+func connectToServer(manager *streaming.StreamManager, dest *go_i2cp.Destination) *streaming.StreamConn {
+	const localPort = 0
+	const remotePort = 8080
 	const connectTimeout = 30 * time.Second
 
 	log.Info().
@@ -113,31 +149,25 @@ func main() {
 		Uint16("remote_port", remotePort).
 		Msg("connecting to server")
 
-	// Create connection with manager support
-	conn, err := dialWithManager(
-		manager,
-		dest,
-		localPort,
-		remotePort,
-		1730, // Default MTU
-		connectTimeout,
-	)
+	conn, err := dialWithManager(manager, dest, localPort, remotePort, 1730, connectTimeout)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to connect")
 	}
-	defer conn.Close()
 
 	log.Info().
 		Str("local", conn.LocalAddr().String()).
 		Str("remote", conn.RemoteAddr().String()).
 		Msg("connected")
 
-	// Run echo test
+	return conn
+}
+
+// runEchoTestOrFail runs the echo test and terminates the program on failure.
+func runEchoTestOrFail(conn *streaming.StreamConn) {
 	testCtx := context.Background()
 	if err := runEchoTest(testCtx, conn); err != nil {
 		log.Fatal().Err(err).Msg("echo test failed")
 	}
-
 	log.Info().Msg("echo test completed successfully")
 }
 
@@ -169,7 +199,7 @@ func dialWithManager(
 	return conn, nil
 }
 
-// runEchoTest sends test messages and verifies echoed responses
+// runEchoTest sends test messages and verifies echoed responses.
 func runEchoTest(ctx context.Context, conn net.Conn) error {
 	testMessages := []string{
 		"Hello, I2P!",
@@ -179,60 +209,88 @@ func runEchoTest(ctx context.Context, conn net.Conn) error {
 	}
 
 	for i, msg := range testMessages {
-		log.Info().
-			Int("test", i+1).
-			Int("total", len(testMessages)).
-			Str("message", msg).
-			Msg("sending test message")
-
-		start := time.Now()
-
-		// Send message
-		n, err := conn.Write([]byte(msg))
-		if err != nil {
-			return fmt.Errorf("write failed: %w", err)
+		if err := runSingleEchoTest(conn, i+1, len(testMessages), msg); err != nil {
+			return err
 		}
-
-		log.Debug().
-			Int("bytes_sent", n).
-			Msg("message sent")
-
-		// Set read deadline
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-
-		// Read echo response
-		buf := make([]byte, 4096)
-		totalRead := 0
-		expected := len(msg)
-
-		for totalRead < expected {
-			n, err := conn.Read(buf[totalRead:])
-			if err != nil {
-				if err == io.EOF {
-					return fmt.Errorf("unexpected EOF after %d bytes", totalRead)
-				}
-				return fmt.Errorf("read failed: %w", err)
-			}
-			totalRead += n
-		}
-
-		rtt := time.Since(start)
-		response := string(buf[:totalRead])
-
-		// Verify echo
-		if response != msg {
-			return fmt.Errorf("echo mismatch: sent %q, got %q", msg, response)
-		}
-
-		log.Info().
-			Int("test", i+1).
-			Int("bytes", totalRead).
-			Dur("rtt", rtt).
-			Msg("echo verified")
-
-		// Brief pause between tests
 		time.Sleep(100 * time.Millisecond)
 	}
 
+	return nil
+}
+
+// runSingleEchoTest sends a single test message and verifies the echoed response.
+func runSingleEchoTest(conn net.Conn, testNum, totalTests int, msg string) error {
+	log.Info().
+		Int("test", testNum).
+		Int("total", totalTests).
+		Str("message", msg).
+		Msg("sending test message")
+
+	start := time.Now()
+
+	if err := sendTestMessage(conn, msg); err != nil {
+		return err
+	}
+
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	response, err := readEchoResponse(conn, len(msg))
+	if err != nil {
+		return err
+	}
+
+	rtt := time.Since(start)
+
+	if err := verifyEchoResponse(msg, response); err != nil {
+		return err
+	}
+
+	log.Info().
+		Int("test", testNum).
+		Int("bytes", len(response)).
+		Dur("rtt", rtt).
+		Msg("echo verified")
+
+	return nil
+}
+
+// sendTestMessage writes a test message to the connection.
+func sendTestMessage(conn net.Conn, msg string) error {
+	n, err := conn.Write([]byte(msg))
+	if err != nil {
+		return fmt.Errorf("write failed: %w", err)
+	}
+
+	log.Debug().
+		Int("bytes_sent", n).
+		Msg("message sent")
+
+	return nil
+}
+
+// readEchoResponse reads the echoed response from the connection until expected bytes are received.
+func readEchoResponse(conn net.Conn, expected int) (string, error) {
+	buf := make([]byte, 4096)
+	totalRead := 0
+
+	for totalRead < expected {
+		n, err := conn.Read(buf[totalRead:])
+		if err != nil {
+			if err == io.EOF {
+				return "", fmt.Errorf("unexpected EOF after %d bytes", totalRead)
+			}
+			return "", fmt.Errorf("read failed: %w", err)
+		}
+		totalRead += n
+	}
+
+	return string(buf[:totalRead]), nil
+}
+
+// verifyEchoResponse checks that the response matches the original message.
+func verifyEchoResponse(sent, received string) error {
+	if received != sent {
+		return fmt.Errorf("echo mismatch: sent %q, got %q", sent, received)
+	}
 	return nil
 }

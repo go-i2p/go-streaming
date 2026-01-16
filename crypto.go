@@ -24,44 +24,68 @@ import (
 //
 // Returns error if marshalling fails or signing fails.
 func SignPacket(pkt *Packet, keyPair *go_i2cp.Ed25519KeyPair) error {
+	if err := validateSignPacketPrereqs(pkt); err != nil {
+		return err
+	}
+
+	data, sigLen, err := prepareDataForSigning(pkt)
+	if err != nil {
+		return err
+	}
+
+	signature, err := signAndValidate(keyPair, data, sigLen)
+	if err != nil {
+		return err
+	}
+
+	pkt.Signature = signature
+	return nil
+}
+
+// validateSignPacketPrereqs checks that the packet meets signing requirements.
+func validateSignPacketPrereqs(pkt *Packet) error {
 	if pkt.FromDestination == nil {
 		return fmt.Errorf("cannot sign packet: FromDestination is nil")
 	}
 	if pkt.Flags&FlagSignatureIncluded == 0 {
 		return fmt.Errorf("cannot sign packet: FlagSignatureIncluded not set")
 	}
+	return nil
+}
 
-	// Marshal packet - signature will be zeros or pre-allocated space
+// prepareDataForSigning marshals the packet and zeros the signature field.
+// Returns the prepared data and the expected signature length.
+func prepareDataForSigning(pkt *Packet) ([]byte, int, error) {
 	data, err := pkt.Marshal()
 	if err != nil {
-		return fmt.Errorf("marshal for signing: %w", err)
+		return nil, 0, fmt.Errorf("marshal for signing: %w", err)
 	}
 
-	// Find signature location in marshaled data and ensure it's zeroed
 	sigOffset := findSignatureOffset(pkt)
 	sigLen := getSignatureLength(pkt.FromDestination)
 	if sigOffset+sigLen > len(data) {
-		return fmt.Errorf("signature offset+length (%d) exceeds data length (%d)", sigOffset+sigLen, len(data))
+		return nil, 0, fmt.Errorf("signature offset+length (%d) exceeds data length (%d)", sigOffset+sigLen, len(data))
 	}
 
-	// Zero the signature field in the data we'll sign
 	for i := 0; i < sigLen; i++ {
 		data[sigOffset+i] = 0
 	}
 
-	// Sign the data
+	return data, sigLen, nil
+}
+
+// signAndValidate signs the data and validates the signature length.
+func signAndValidate(keyPair *go_i2cp.Ed25519KeyPair, data []byte, expectedLen int) ([]byte, error) {
 	signature, err := keyPair.Sign(data)
 	if err != nil {
-		return fmt.Errorf("sign packet: %w", err)
+		return nil, fmt.Errorf("sign packet: %w", err)
 	}
 
-	if len(signature) != sigLen {
-		return fmt.Errorf("signature length mismatch: expected %d, got %d", sigLen, len(signature))
+	if len(signature) != expectedLen {
+		return nil, fmt.Errorf("signature length mismatch: expected %d, got %d", expectedLen, len(signature))
 	}
 
-	// Update packet with signature
-	pkt.Signature = signature
-	return nil
+	return signature, nil
 }
 
 // VerifyPacketSignature verifies a packet's signature using the public key

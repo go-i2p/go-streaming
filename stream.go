@@ -1026,6 +1026,7 @@ func (l *StreamListener) queueConnectionForAccept(conn *StreamConn, remotePort u
 	}
 }
 
+// handleIncomingSYN processes an incoming SYN packet to establish a new connection.
 func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16, remoteDest *go_i2cp.Destination) error {
 	log.Debug().
 		Uint32("remoteSeq", synPkt.SequenceNum).
@@ -1033,8 +1034,22 @@ func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16, re
 		Uint16("localPort", l.localPort).
 		Msg("received SYN")
 
-	peerDest, err := l.validateSYNSource(synPkt, remoteDest)
+	if err := l.validateIncomingSYN(synPkt, remoteDest); err != nil {
+		return err
+	}
+
+	peerDest, _ := l.validateSYNSource(synPkt, remoteDest)
+	conn, err := l.createIncomingConnection(synPkt, remotePort, peerDest)
 	if err != nil {
+		return err
+	}
+
+	return l.finalizeIncomingConnection(conn, remotePort)
+}
+
+// validateIncomingSYN performs all validation checks on an incoming SYN packet.
+func (l *StreamListener) validateIncomingSYN(synPkt *Packet, remoteDest *go_i2cp.Destination) error {
+	if _, err := l.validateSYNSource(synPkt, remoteDest); err != nil {
 		return err
 	}
 
@@ -1042,15 +1057,11 @@ func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16, re
 		return err
 	}
 
-	if err := l.verifySYNReplayPrevention(synPkt); err != nil {
-		return err
-	}
+	return l.verifySYNReplayPrevention(synPkt)
+}
 
-	conn, err := l.createIncomingConnection(synPkt, remotePort, peerDest)
-	if err != nil {
-		return err
-	}
-
+// finalizeIncomingConnection registers the connection, sends SYN-ACK, and starts the receive loop.
+func (l *StreamListener) finalizeIncomingConnection(conn *StreamConn, remotePort uint16) error {
 	if l.manager != nil {
 		l.manager.RegisterConnection(l.localPort, remotePort, conn)
 	}
@@ -1354,6 +1365,12 @@ func (s *StreamConn) Write(data []byte) (int, error) {
 		return 0, err
 	}
 
+	return s.writeDataLocked(data)
+}
+
+// writeDataLocked writes data in chunks respecting MTU and window limits.
+// Must be called with s.mu held.
+func (s *StreamConn) writeDataLocked(data []byte) (int, error) {
 	total := len(data)
 	mtu := int(s.getNegotiatedMTULocked())
 
@@ -1363,6 +1380,22 @@ func (s *StreamConn) Write(data []byte) (int, error) {
 		Uint32("startSeq", s.sendSeq).
 		Msg("writing data")
 
+	written, err := s.writeChunksLocked(data, total, mtu)
+	if err != nil {
+		return written, err
+	}
+
+	log.Debug().
+		Int("bytes", total).
+		Uint32("endSeq", s.sendSeq).
+		Msg("write complete")
+
+	return total, nil
+}
+
+// writeChunksLocked writes data in MTU-sized chunks with flow control.
+// Must be called with s.mu held.
+func (s *StreamConn) writeChunksLocked(data []byte, total, mtu int) (int, error) {
 	for len(data) > 0 {
 		if err := s.waitForWindowSpace(total - len(data)); err != nil {
 			return total - len(data), err
@@ -1379,12 +1412,6 @@ func (s *StreamConn) Write(data []byte) (int, error) {
 
 		data = data[len(chunk):]
 	}
-
-	log.Debug().
-		Int("bytes", total).
-		Uint32("endSeq", s.sendSeq).
-		Msg("write complete")
-
 	return total, nil
 }
 
@@ -2677,34 +2704,48 @@ func (s *StreamConn) Close() error {
 
 	log.Info().Msg("closing connection")
 
-	// Send CLOSE packet if connection is established
-	if s.state == StateEstablished {
-		if err := s.sendCloseLocked(); err != nil {
-			log.Warn().Err(err).Msg("failed to send CLOSE packet")
-		}
-		s.setState(StateClosing)
+	s.sendCloseIfEstablished()
+	s.cleanupConnectionLocked()
+
+	return nil
+}
+
+// sendCloseIfEstablished sends a CLOSE packet if the connection is established.
+// Must be called with s.mu held.
+func (s *StreamConn) sendCloseIfEstablished() {
+	if s.state != StateEstablished {
+		return
 	}
 
-	// Unregister from manager if using manager pattern
+	if err := s.sendCloseLocked(); err != nil {
+		log.Warn().Err(err).Msg("failed to send CLOSE packet")
+	}
+	s.setState(StateClosing)
+}
+
+// cleanupConnectionLocked performs connection cleanup: unregisters from manager,
+// cancels the receive loop, marks as closed, and wakes blocked goroutines.
+// Must be called with s.mu held.
+func (s *StreamConn) cleanupConnectionLocked() {
 	if s.manager != nil {
 		s.manager.UnregisterConnection(s.localPort, s.remotePort)
 	}
 
-	// Cancel receive loop
 	s.cancel()
-
-	// Mark as closed
 	s.closed = true
 
-	// Wake up any blocked readers and writers
+	s.wakeBlockedGoroutines()
+}
+
+// wakeBlockedGoroutines broadcasts to wake up any blocked readers and writers.
+// Must be called with s.mu held.
+func (s *StreamConn) wakeBlockedGoroutines() {
 	if s.recvCond != nil {
 		s.recvCond.Broadcast()
 	}
 	if s.sendCond != nil {
 		s.sendCond.Broadcast()
 	}
-
-	return nil
 }
 
 // sendCloseLocked sends a CLOSE packet to initiate connection teardown.

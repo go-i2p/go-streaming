@@ -261,22 +261,28 @@ func (p *Packet) marshalOfflineSignature(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (p *Packet) Marshal() ([]byte, error) {
-	// Calculate option data sizes
-	fromBytes, err := p.calculateFromDestinationSize()
+// calculateOptionSizes computes all size components needed for marshaling optional fields.
+// It returns the from destination bytes, signature length, offline signature size, and total option size.
+func (p *Packet) calculateOptionSizes() (fromBytes []byte, sigLen int, offlineSigSize int, optionSize uint16, err error) {
+	fromBytes, err = p.calculateFromDestinationSize()
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, 0, err
 	}
-	sigLen, err := p.calculateSignatureSize()
+	sigLen, err = p.calculateSignatureSize()
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, 0, err
 	}
-	offlineSigSize, err := p.calculateOfflineSignatureSize()
+	offlineSigSize, err = p.calculateOfflineSignatureSize()
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, 0, err
 	}
 
-	// Calculate total option size
+	optionSize = p.calculateTotalOptionSize(len(fromBytes), sigLen, offlineSigSize)
+	return fromBytes, sigLen, offlineSigSize, optionSize, nil
+}
+
+// calculateTotalOptionSize computes the total size of all optional fields based on flags.
+func (p *Packet) calculateTotalOptionSize(fromBytesLen, sigLen, offlineSigSize int) uint16 {
 	optionSize := uint16(0)
 	if p.Flags&FlagDelayRequested != 0 {
 		optionSize += 2
@@ -284,12 +290,14 @@ func (p *Packet) Marshal() ([]byte, error) {
 	if p.Flags&FlagMaxPacketSizeIncluded != 0 {
 		optionSize += 2
 	}
-	optionSize += uint16(len(fromBytes) + sigLen + offlineSigSize)
+	optionSize += uint16(fromBytesLen + sigLen + offlineSigSize)
+	return optionSize
+}
 
-	// Build packet
-	buf := make([]byte, 0, 22+int(optionSize)+len(p.Payload))
-	buf = p.marshalRequiredFields(buf)
-
+// marshalPacketBody assembles the packet body after the required fields.
+// It marshals NACKs, flags, optional fields, from destination, signature, and offline signature.
+func (p *Packet) marshalPacketBody(buf, fromBytes []byte, sigLen int, optionSize uint16) ([]byte, error) {
+	var err error
 	buf, err = p.marshalNACKs(buf)
 	if err != nil {
 		return nil, err
@@ -308,6 +316,24 @@ func (p *Packet) Marshal() ([]byte, error) {
 	}
 
 	buf, err = p.marshalOfflineSignature(buf)
+	if err != nil {
+		return nil, err
+	}
+
+	return buf, nil
+}
+
+// Marshal serializes the Packet into bytes per I2P streaming protocol format.
+func (p *Packet) Marshal() ([]byte, error) {
+	fromBytes, sigLen, _, optionSize, err := p.calculateOptionSizes()
+	if err != nil {
+		return nil, err
+	}
+
+	buf := make([]byte, 0, 22+int(optionSize)+len(p.Payload))
+	buf = p.marshalRequiredFields(buf)
+
+	buf, err = p.marshalPacketBody(buf, fromBytes, sigLen, optionSize)
 	if err != nil {
 		return nil, err
 	}
@@ -452,11 +478,34 @@ func (p *Packet) unmarshalOfflineSignature(data []byte, offset, optionsEnd int) 
 	}
 
 	offsig := &OfflineSig{}
+	offset = p.unmarshalOfflineSigHeader(data, offset, offsig)
+
+	var err error
+	offset, err = p.unmarshalTransientKey(data, offset, optionsEnd, offsig)
+	if err != nil {
+		return offset, err
+	}
+
+	offset, err = p.unmarshalDestSignature(data, offset, optionsEnd, offsig)
+	if err != nil {
+		return offset, err
+	}
+
+	p.OfflineSignature = offsig
+	return offset, nil
+}
+
+// unmarshalOfflineSigHeader parses the expires and transient sig type fields.
+func (p *Packet) unmarshalOfflineSigHeader(data []byte, offset int, offsig *OfflineSig) int {
 	offsig.Expires = binary.BigEndian.Uint32(data[offset:])
 	offset += 4
 	offsig.TransientSigType = binary.BigEndian.Uint16(data[offset:])
 	offset += 2
+	return offset
+}
 
+// unmarshalTransientKey parses the transient public key from the offline signature.
+func (p *Packet) unmarshalTransientKey(data []byte, offset, optionsEnd int, offsig *OfflineSig) (int, error) {
 	transientKeyLen := getPublicKeyLength(offsig.TransientSigType)
 	if transientKeyLen == 0 {
 		return offset, fmt.Errorf("cannot determine transient public key length for type %d", offsig.TransientSigType)
@@ -467,8 +516,11 @@ func (p *Packet) unmarshalOfflineSignature(data []byte, offset, optionsEnd int) 
 	}
 	offsig.TransientPublicKey = make([]byte, transientKeyLen)
 	copy(offsig.TransientPublicKey, data[offset:offset+transientKeyLen])
-	offset += transientKeyLen
+	return offset + transientKeyLen, nil
+}
 
+// unmarshalDestSignature parses the destination signature from the offline signature.
+func (p *Packet) unmarshalDestSignature(data []byte, offset, optionsEnd int, offsig *OfflineSig) (int, error) {
 	destSigLen := getSignatureLength(p.FromDestination)
 	if destSigLen == 0 {
 		return offset, fmt.Errorf("cannot determine offline signature dest signature length (no FROM destination)")
@@ -479,44 +531,36 @@ func (p *Packet) unmarshalOfflineSignature(data []byte, offset, optionsEnd int) 
 	}
 	offsig.DestSignature = make([]byte, destSigLen)
 	copy(offsig.DestSignature, data[offset:offset+destSigLen])
-	offset += destSigLen
-
-	p.OfflineSignature = offsig
-	return offset, nil
+	return offset + destSigLen, nil
 }
 
-func (p *Packet) Unmarshal(data []byte) error {
-	// Minimum packet size: 22 bytes (18 required + 1 NACKCount + 1 ResendDelay + 2 Flags + 2 OptionSize)
-	if len(data) < 22 {
-		return fmt.Errorf("packet too short: got %d bytes, need at least 22", len(data))
-	}
-
-	// Parse required fields (18 bytes)
-	offset := p.unmarshalRequiredFields(data)
+// unmarshalHeader parses the packet header including NACKs, flags, and option size.
+// It returns the offset after the header, the option size, and the options end position.
+func (p *Packet) unmarshalHeader(data []byte) (offset int, optionsEnd int, err error) {
+	offset = p.unmarshalRequiredFields(data)
 	nackCount := data[16]
 
-	// Parse NACKs
-	offset, err := p.unmarshalNACKs(data, offset, nackCount)
+	offset, err = p.unmarshalNACKs(data, offset, nackCount)
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
 
-	// Flags (2 bytes)
 	p.Flags = binary.BigEndian.Uint16(data[offset:])
 	offset += 2
 
-	// Option Size (2 bytes)
 	optionSize := binary.BigEndian.Uint16(data[offset:])
 	offset += 2
 
-	// Validate we have enough data for options
 	if len(data) < offset+int(optionSize) {
-		return fmt.Errorf("packet too short for options: got %d bytes, need %d", len(data), offset+int(optionSize))
+		return 0, 0, fmt.Errorf("packet too short for options: got %d bytes, need %d", len(data), offset+int(optionSize))
 	}
 
-	optionsEnd := offset + int(optionSize)
+	return offset, offset + int(optionSize), nil
+}
 
-	// Parse optional fields in spec order
+// unmarshalOptions parses all optional fields from the packet data.
+func (p *Packet) unmarshalOptions(data []byte, offset, optionsEnd int) error {
+	var err error
 	if offset, err = p.unmarshalOptionalDelay(data, offset, optionsEnd); err != nil {
 		return err
 	}
@@ -529,11 +573,27 @@ func (p *Packet) Unmarshal(data []byte) error {
 	if offset, err = p.unmarshalSignature(data, offset, optionsEnd); err != nil {
 		return err
 	}
-	if offset, err = p.unmarshalOfflineSignature(data, offset, optionsEnd); err != nil {
+	if _, err = p.unmarshalOfflineSignature(data, offset, optionsEnd); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Unmarshal parses bytes into a Packet per I2P streaming protocol format.
+func (p *Packet) Unmarshal(data []byte) error {
+	if len(data) < 22 {
+		return fmt.Errorf("packet too short: got %d bytes, need at least 22", len(data))
+	}
+
+	offset, optionsEnd, err := p.unmarshalHeader(data)
+	if err != nil {
 		return err
 	}
 
-	// Payload is everything remaining after options
+	if err := p.unmarshalOptions(data, offset, optionsEnd); err != nil {
+		return err
+	}
+
 	if optionsEnd < len(data) {
 		p.Payload = data[optionsEnd:]
 	}
