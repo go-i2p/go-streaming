@@ -1,12 +1,6 @@
-//go:build system
-
 // System integration tests for go-streaming
 //
 // These tests require a FULLY OPERATIONAL I2P router with I2CP enabled on localhost:7654.
-// They are separated from unit tests and only run when explicitly requested.
-//
-// To run these tests:
-//   go test -tags=system -v -timeout=5m
 //
 // Prerequisites:
 //   - I2P router running (i2pd or Java I2P)
@@ -339,7 +333,7 @@ func TestSystem_EchoServerClient(t *testing.T) {
 
 	// Dial server
 	t.Log("Client dialing server...")
-	conn, err := Dial(clientManager.Session(), serverDest, 0, 9000)
+	conn, err := DialWithManager(clientManager, serverDest, 0, 9000)
 	require.NoError(t, err, "Dial failed")
 	defer conn.Close()
 
@@ -455,7 +449,7 @@ func TestSystem_LargeDataTransfer(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// Connect and transfer
-	conn, err := Dial(clientManager.Session(), serverDest, 0, 9001)
+	conn, err := DialWithManager(clientManager, serverDest, 0, 9001)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -568,7 +562,7 @@ func TestSystem_ConcurrentConnections(t *testing.T) {
 		go func(id int) {
 			defer clientWg.Done()
 
-			conn, err := Dial(clientManager.Session(), serverDest, 0, 9002)
+			conn, err := DialWithManager(clientManager, serverDest, 0, 9002)
 			if err != nil {
 				t.Logf("Dial %d failed: %v", id, err)
 				return
@@ -614,20 +608,24 @@ func TestSystem_ConnectionTimeout(t *testing.T) {
 	manager := createTestManager(t, client)
 	defer manager.Close()
 
-	// Create a fake destination (won't exist)
-	// Using minimal empty destination for timeout test
-	fakeDest := &go_i2cp.Destination{}
+	// Create a fake but valid destination (won't exist on network)
+	// This generates a properly formatted destination that will timeout on dial
+	crypto := go_i2cp.NewCrypto()
+	fakeDest, err := go_i2cp.NewDestination(crypto)
+	require.NoError(t, err, "Failed to create fake destination")
 
-	// Attempt to dial non-existent destination (should timeout)
+	// Attempt to dial non-existent destination
+	// Uses DialWithManager which properly registers connection for SYN-ACK routing
+	// The handshake will timeout because no one will respond
 	t.Log("Attempting to dial non-existent destination...")
-	conn, err := Dial(manager.Session(), fakeDest, 0, 8080)
+	conn, err := DialWithManager(manager, fakeDest, 0, 8080)
 
-	// This may fail immediately or timeout - both are acceptable
+	// Should fail with timeout or connection error
 	if err != nil {
 		t.Logf("Dial failed as expected: %v", err)
 	} else if conn != nil {
 		conn.Close()
-		t.Log("Connection created (may timeout on actual use)")
+		t.Fatal("Connection should not have succeeded to fake destination")
 	}
 
 	t.Log("✓ Connection timeout test passed")
