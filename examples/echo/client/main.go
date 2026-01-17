@@ -47,10 +47,12 @@ func main() {
 	client := createI2CPClient()
 	defer client.Close()
 
+	// IMPORTANT: Start ProcessIO loop BEFORE creating the stream manager.
+	// ProcessIO must be running to receive SessionCreated responses from the router.
+	startProcessIOLoop(client)
+
 	manager := createStreamManager(client)
 	defer manager.Close()
-
-	startProcessIOLoop(client)
 
 	dest := parseDestinationFromBase64(serverDestB64)
 	conn := connectToServer(manager, dest)

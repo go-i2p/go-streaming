@@ -45,13 +45,21 @@ func main() {
 	client := createI2CPClient()
 	defer client.Close()
 
+	// IMPORTANT: Start ProcessIO loop BEFORE creating the stream manager.
+	// ProcessIO must be running to receive SessionCreated responses from the router.
+	startProcessIOLoop(client)
+
 	manager := createStreamManager(client)
 	defer manager.Close()
 
-	startProcessIOLoop(client)
-
 	listener := createListener(manager)
 	defer listener.Close()
+	// print the destination for clients to connect
+	if dest := manager.Destination(); dest != nil {
+		log.Info().
+			Str("destination", dest.Base64()).
+			Msg("server destination")
+	}
 
 	shutdownCtx, shutdownCancel := setupShutdownHandler(listener)
 	defer shutdownCancel()
@@ -86,6 +94,7 @@ func createI2CPClient() *go_i2cp.Client {
 // createStreamManager creates a stream manager from the I2CP client and starts
 // an I2CP session. It terminates the program with a fatal error on failure.
 func createStreamManager(client *go_i2cp.Client) *streaming.StreamManager {
+	log.Info().Msg("creating stream manager and starting session")
 	manager, err := streaming.NewStreamManager(client)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create stream manager")
