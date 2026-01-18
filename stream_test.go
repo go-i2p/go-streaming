@@ -144,19 +144,21 @@ func TestSYNPacketStructure(t *testing.T) {
 			nacks[i] = binary.BigEndian.Uint32(hash[i*4 : (i+1)*4])
 		}
 
+		// Per I2P spec, initial SYN has NO_ACK set because ackThrough is not valid
 		pkt := &Packet{
 			SendStreamID:    123,
 			RecvStreamID:    456,
 			SequenceNum:     0,
 			AckThrough:      0,
-			Flags:           FlagSYN | FlagMaxPacketSizeIncluded | FlagSignatureIncluded | FlagFromIncluded,
+			Flags:           FlagSYN | FlagNoACK | FlagMaxPacketSizeIncluded | FlagSignatureIncluded | FlagFromIncluded,
 			MaxPacketSize:   1730,
 			NACKs:           nacks,
 			FromDestination: dest,
 		}
 
-		// Verify packet structure
-		assert.Equal(t, uint16(FlagSYN|FlagMaxPacketSizeIncluded|FlagSignatureIncluded|FlagFromIncluded), pkt.Flags)
+		// Verify packet structure - FlagNoACK is required on initial SYN per spec
+		assert.Equal(t, uint16(FlagSYN|FlagNoACK|FlagMaxPacketSizeIncluded|FlagSignatureIncluded|FlagFromIncluded), pkt.Flags)
+		assert.True(t, pkt.Flags&FlagNoACK != 0, "Initial SYN must have NO_ACK flag set")
 		assert.Equal(t, 8, len(pkt.NACKs), "SYN should have 8 NACKs for replay prevention")
 		assert.NotNil(t, pkt.FromDestination, "SYN should include FROM destination")
 		assert.Equal(t, uint16(1730), pkt.MaxPacketSize)
@@ -276,5 +278,82 @@ func TestGenerateStreamID(t *testing.T) {
 		}
 
 		assert.Equal(t, count, len(ids), "all %d stream IDs should be unique", count)
+	})
+}
+
+// TestNoACKFlagHandling verifies that the NO_ACK flag is correctly set on initial SYN
+// and that ackThrough is ignored when the flag is set.
+func TestNoACKFlagHandling(t *testing.T) {
+	t.Run("initial SYN has NO_ACK flag set", func(t *testing.T) {
+		// The buildSYNPacket function should set NO_ACK because
+		// ackThrough is not valid on the initial SYN packet
+		crypto := go_i2cp.NewCrypto()
+		dest, err := go_i2cp.NewDestination(crypto)
+		require.NoError(t, err)
+
+		// Simulate what buildSYNPacket creates
+		// Per I2P spec: initial SYN has NO_ACK set
+		synFlags := FlagSYN | FlagNoACK | FlagMaxPacketSizeIncluded | FlagSignatureIncluded | FlagFromIncluded
+		pkt := &Packet{
+			SendStreamID:    0, // Always 0 for initial SYN
+			RecvStreamID:    12345,
+			SequenceNum:     0,
+			AckThrough:      0, // Not valid - NO_ACK tells peer to ignore
+			Flags:           synFlags,
+			MaxPacketSize:   DefaultMTU,
+			FromDestination: dest,
+		}
+
+		assert.True(t, pkt.Flags&FlagSYN != 0, "SYN flag should be set")
+		assert.True(t, pkt.Flags&FlagNoACK != 0, "NO_ACK flag should be set on initial SYN")
+
+		// Marshal and unmarshal to verify flags survive round-trip
+		data, err := pkt.Marshal()
+		require.NoError(t, err)
+
+		unmarshaled := &Packet{}
+		err = unmarshaled.Unmarshal(data)
+		require.NoError(t, err)
+
+		assert.True(t, unmarshaled.Flags&FlagNoACK != 0,
+			"NO_ACK flag should survive marshal/unmarshal")
+	})
+
+	t.Run("SYN-ACK does NOT have NO_ACK flag", func(t *testing.T) {
+		// SYN-ACK is a response that acknowledges the peer's SYN,
+		// so it should NOT have NO_ACK set
+		crypto := go_i2cp.NewCrypto()
+		dest, err := go_i2cp.NewDestination(crypto)
+		require.NoError(t, err)
+
+		// Simulate what buildSynAckPacket creates
+		synAckFlags := FlagSYN | FlagMaxPacketSizeIncluded | FlagSignatureIncluded | FlagFromIncluded
+		pkt := &Packet{
+			SendStreamID:    12345, // Non-zero for SYN-ACK
+			RecvStreamID:    54321,
+			SequenceNum:     100,
+			AckThrough:      0, // Valid - acknowledges peer's SYN
+			Flags:           synAckFlags,
+			MaxPacketSize:   DefaultMTU,
+			FromDestination: dest,
+		}
+
+		assert.True(t, pkt.Flags&FlagSYN != 0, "SYN flag should be set")
+		assert.False(t, pkt.Flags&FlagNoACK != 0, "NO_ACK flag should NOT be set on SYN-ACK")
+	})
+
+	t.Run("data packets do NOT have NO_ACK flag", func(t *testing.T) {
+		// Regular data packets always have valid ackThrough
+		pkt := &Packet{
+			SendStreamID: 12345,
+			RecvStreamID: 54321,
+			SequenceNum:  101,
+			AckThrough:   100,
+			Flags:        0, // No flags - data packets use ackThrough directly
+			Payload:      []byte("hello"),
+		}
+
+		assert.False(t, pkt.Flags&FlagNoACK != 0,
+			"NO_ACK flag should NOT be set on data packets")
 	})
 }

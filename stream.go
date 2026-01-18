@@ -557,13 +557,14 @@ func (s *StreamConn) generateReplayPreventionNACKs() ([]uint32, error) {
 }
 
 // buildSYNPacket constructs the SYN packet with all required fields.
+// Per I2P streaming spec, initial SYN has FlagNoACK set because ackThrough is not valid yet.
 func (s *StreamConn) buildSYNPacket(nacks []uint32) *Packet {
 	return &Packet{
 		SendStreamID:    0,               // Always 0 in initial SYN per spec
 		RecvStreamID:    s.localStreamID, // Our stream ID for peer to use
 		SequenceNum:     s.sendSeq,
-		AckThrough:      0, // No ACK yet
-		Flags:           FlagSYN | FlagMaxPacketSizeIncluded | FlagSignatureIncluded | FlagFromIncluded,
+		AckThrough:      0, // No ACK yet - FlagNoACK tells peer to ignore this
+		Flags:           FlagSYN | FlagNoACK | FlagMaxPacketSizeIncluded | FlagSignatureIncluded | FlagFromIncluded,
 		MaxPacketSize:   s.localMTU,
 		NACKs:           nacks,
 		FromDestination: s.session.Destination(),
@@ -2193,9 +2194,13 @@ func (s *StreamConn) handleOptionalDelayLocked(pkt *Packet) {
 
 // handleAckLocked processes an incoming ACK packet.
 // Updates ack tracking, RTT estimates, congestion window, and handles NACKs.
+// Per I2P spec, ackThrough is always valid unless FlagNoACK is set.
 // Must be called with s.mu held.
 func (s *StreamConn) handleAckLocked(pkt *Packet) error {
-	if seqGreaterThan(pkt.AckThrough, s.ackThrough) {
+	// Per I2P streaming spec, ignore ackThrough if NO_ACK flag is set
+	if pkt.Flags&FlagNoACK != 0 {
+		log.Debug().Msg("ignoring ackThrough due to NO_ACK flag")
+	} else if seqGreaterThan(pkt.AckThrough, s.ackThrough) {
 		oldAck := s.ackThrough
 		s.ackThrough = pkt.AckThrough
 		log.Debug().
