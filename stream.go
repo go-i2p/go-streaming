@@ -2603,8 +2603,8 @@ func (s *StreamConn) sendAckLocked() error {
 		RecvStreamID:  s.remoteStreamID, // Peer's stream ID
 		SequenceNum:   0,                // seq=0 without SYN = plain ACK per spec
 		AckThrough:    s.recvSeq - 1,
-		Flags:         0,                // No flags needed for plain ACK
-		OptionalDelay: 0,                // Request immediate ACK (MVP: no delay optimization)
+		Flags:         0, // No flags needed for plain ACK
+		OptionalDelay: 0, // Request immediate ACK (MVP: no delay optimization)
 	}
 
 	// Include NACKs if we have any gaps in received sequences
@@ -2628,10 +2628,10 @@ func (s *StreamConn) sendChokeSignalLocked() error {
 	pkt := &Packet{
 		SendStreamID:  s.localStreamID,
 		RecvStreamID:  s.remoteStreamID,
-		SequenceNum:   0,                          // seq=0 without SYN = plain ACK per spec
+		SequenceNum:   0, // seq=0 without SYN = plain ACK per spec
 		AckThrough:    s.recvSeq - 1,
-		Flags:         FlagDelayRequested,         // Only delay flag needed for choke
-		OptionalDelay: 61000,                      // >60000 = choked per I2P streaming spec
+		Flags:         FlagDelayRequested, // Only delay flag needed for choke
+		OptionalDelay: 61000,              // >60000 = choked per I2P streaming spec
 	}
 
 	// Include NACKs if we have any gaps (even when choked, request missing packets)
@@ -2655,7 +2655,7 @@ func (s *StreamConn) sendUnchokeSignalLocked() error {
 	pkt := &Packet{
 		SendStreamID:  s.localStreamID,
 		RecvStreamID:  s.remoteStreamID,
-		SequenceNum:   0,                  // seq=0 without SYN = plain ACK per spec
+		SequenceNum:   0, // seq=0 without SYN = plain ACK per spec
 		AckThrough:    s.recvSeq - 1,
 		Flags:         FlagDelayRequested, // Only delay flag needed for unchoke
 		OptionalDelay: 0,                  // 0-60000 = not choked

@@ -292,7 +292,7 @@ func TestSendSynAckPacketFormat(t *testing.T) {
 		SendStreamID: 1234, // > 0 indicates this is a SYN-ACK response
 		RecvStreamID: 5678,
 		SequenceNum:  100,
-		AckThrough:   42, // ACKing the SYN
+		AckThrough:   42,      // ACKing the SYN
 		Flags:        FlagSYN, // Only SYN flag needed for SYN-ACK per spec
 	}
 
@@ -305,8 +305,8 @@ func TestSendSynAckPacketFormat(t *testing.T) {
 
 	assert.Equal(t, pkt.SequenceNum, parsed.SequenceNum)
 	assert.Equal(t, pkt.AckThrough, parsed.AckThrough)
-	assert.Equal(t, FlagSYN, parsed.Flags)            // SYN-ACK only has SYN flag
-	assert.True(t, parsed.SendStreamID > 0)           // SYN-ACK has assigned stream ID
+	assert.Equal(t, FlagSYN, parsed.Flags)  // SYN-ACK only has SYN flag
+	assert.True(t, parsed.SendStreamID > 0) // SYN-ACK has assigned stream ID
 }
 
 // TestSendACKPacketFormat verifies final ACK packet format.
@@ -315,9 +315,9 @@ func TestSendACKPacketFormat(t *testing.T) {
 	pkt := &Packet{
 		SendStreamID: 1234,
 		RecvStreamID: 5678,
-		SequenceNum:  0, // seq=0 without SYN = plain ACK per spec
+		SequenceNum:  0,   // seq=0 without SYN = plain ACK per spec
 		AckThrough:   100, // ACKing the SYN-ACK
-		Flags:        0, // No flags needed for plain ACK
+		Flags:        0,   // No flags needed for plain ACK
 	}
 
 	data, err := pkt.Marshal()
@@ -328,9 +328,9 @@ func TestSendACKPacketFormat(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, pkt.AckThrough, parsed.AckThrough)
-	assert.Equal(t, uint16(0), parsed.Flags)          // No flags for plain ACK
-	assert.Equal(t, uint32(0), parsed.SequenceNum)    // seq=0 for plain ACK
-	assert.Equal(t, uint16(0), parsed.Flags&FlagSYN)  // No SYN flag
+	assert.Equal(t, uint16(0), parsed.Flags)         // No flags for plain ACK
+	assert.Equal(t, uint32(0), parsed.SequenceNum)   // seq=0 for plain ACK
+	assert.Equal(t, uint16(0), parsed.Flags&FlagSYN) // No SYN flag
 }
 
 // TestProcessSynAck verifies SYN-ACK processing logic.
@@ -350,8 +350,8 @@ func TestProcessSynAck(t *testing.T) {
 	synAckPkt := &Packet{
 		SendStreamID: 5678,
 		RecvStreamID: 1234,
-		SequenceNum:  100, // Remote ISN
-		AckThrough:   42,  // ACKing our SYN
+		SequenceNum:  100,         // Remote ISN
+		AckThrough:   42,          // ACKing our SYN
 		Flags:        FlagSYN | 0, // No flags needed - ackThrough always valid per spec
 	}
 

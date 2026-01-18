@@ -267,8 +267,8 @@ func TestChokeWithoutFlagNotProcessed(t *testing.T) {
 
 	// Packet with high OptionalDelay but without FlagDelayRequested
 	pkt := &Packet{
-		Flags:         0, // No FlagDelayRequested - per spec no flags needed for ACK
-		OptionalDelay: 65000,   // Would indicate choke if flag was set
+		Flags:         0,     // No FlagDelayRequested - per spec no flags needed for ACK
+		OptionalDelay: 65000, // Would indicate choke if flag was set
 		AckThrough:    0,
 	}
 
