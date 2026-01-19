@@ -229,19 +229,35 @@ func (p *Packet) marshalFlagsAndOptionSize(buf []byte, optionSize uint16) []byte
 	return buf
 }
 
-// marshalOptionalFields writes the optional delay and max packet size fields.
+// marshalDelayField writes the optional delay field (order 1 per spec).
 // Returns the updated buffer.
-func (p *Packet) marshalOptionalFields(buf []byte) []byte {
+func (p *Packet) marshalDelayField(buf []byte) []byte {
+	if p.Flags&FlagDelayRequested == 0 {
+		return buf
+	}
 	var tmp2 [2]byte
-	if p.Flags&FlagDelayRequested != 0 {
-		binary.BigEndian.PutUint16(tmp2[:], p.OptionalDelay)
-		buf = append(buf, tmp2[:]...)
+	binary.BigEndian.PutUint16(tmp2[:], p.OptionalDelay)
+	return append(buf, tmp2[:]...)
+}
+
+// marshalFromDestination writes the FROM destination field (order 2 per spec).
+// Returns the updated buffer.
+func (p *Packet) marshalFromDestination(buf, fromBytes []byte) []byte {
+	if p.Flags&FlagFromIncluded == 0 {
+		return buf
 	}
-	if p.Flags&FlagMaxPacketSizeIncluded != 0 {
-		binary.BigEndian.PutUint16(tmp2[:], p.MaxPacketSize)
-		buf = append(buf, tmp2[:]...)
+	return append(buf, fromBytes...)
+}
+
+// marshalMaxPacketSize writes the max packet size field (order 3 per spec).
+// Returns the updated buffer.
+func (p *Packet) marshalMaxPacketSize(buf []byte) []byte {
+	if p.Flags&FlagMaxPacketSizeIncluded == 0 {
+		return buf
 	}
-	return buf
+	var tmp2 [2]byte
+	binary.BigEndian.PutUint16(tmp2[:], p.MaxPacketSize)
+	return append(buf, tmp2[:]...)
 }
 
 // marshalSignature writes the signature field to the buffer.
@@ -328,7 +344,12 @@ func (p *Packet) calculateTotalOptionSize(fromBytesLen, sigLen, offlineSigSize i
 }
 
 // marshalPacketBody assembles the packet body after the required fields.
-// It marshals NACKs, flags, optional fields, from destination, signature, and offline signature.
+// Per I2P streaming spec, option data order is:
+//  1. DELAY_REQUESTED (2 bytes)
+//  2. FROM_INCLUDED (variable length destination)
+//  3. MAX_PACKET_SIZE_INCLUDED (2 bytes)
+//  4. OFFLINE_SIGNATURE (variable length)
+//  5. SIGNATURE_INCLUDED (variable length)
 func (p *Packet) marshalPacketBody(buf, fromBytes []byte, sigLen int, optionSize uint16) ([]byte, error) {
 	var err error
 	buf, err = p.marshalNACKs(buf)
@@ -337,18 +358,18 @@ func (p *Packet) marshalPacketBody(buf, fromBytes []byte, sigLen int, optionSize
 	}
 
 	buf = p.marshalFlagsAndOptionSize(buf, optionSize)
-	buf = p.marshalOptionalFields(buf)
 
-	if p.Flags&FlagFromIncluded != 0 {
-		buf = append(buf, fromBytes...)
-	}
+	// Option data in spec order: DELAY (1) -> FROM (2) -> MAX_PACKET_SIZE (3) -> OFFLINE_SIG (4) -> SIGNATURE (5)
+	buf = p.marshalDelayField(buf)
+	buf = p.marshalFromDestination(buf, fromBytes)
+	buf = p.marshalMaxPacketSize(buf)
 
-	buf, err = p.marshalSignature(buf, sigLen)
+	buf, err = p.marshalOfflineSignature(buf)
 	if err != nil {
 		return nil, err
 	}
 
-	buf, err = p.marshalOfflineSignature(buf)
+	buf, err = p.marshalSignature(buf, sigLen)
 	if err != nil {
 		return nil, err
 	}
@@ -387,15 +408,16 @@ func (p *Packet) Marshal() ([]byte, error) {
 //   - SequenceNum: 4 bytes (required)
 //   - AckThrough: 4 bytes (required)
 //   - NACKCount: 1 byte (required, 0-255)
-//   - ResendDelay: 1 byte (required, changed from 2 bytes per spec)
-//   - NACKs: 4 bytes each (NACKCount × 4 bytes, optional if NACKCount > 0)
+//   - NACKs: 4 bytes each (NACKCount × 4 bytes, if NACKCount > 0)
+//   - ResendDelay: 1 byte (required)
 //   - Flags: 2 bytes (required)
 //   - Option Size: 2 bytes (required)
-//   - Option Data: variable length (determined by flags and Option Size)
-//   - OptionalDelay: 2 bytes (if FlagDelayRequested is set)
-//   - MaxPacketSize: 2 bytes (if FlagMaxPacketSizeIncluded is set)
-//   - FROM destination: variable length 387+ bytes (if FlagFromIncluded is set)
-//   - Signature: variable length 40-512 bytes (if FlagSignatureIncluded is set)
+//   - Option Data (in order per spec):
+//     1. OptionalDelay: 2 bytes (if FlagDelayRequested is set)
+//     2. FROM destination: variable length 387+ bytes (if FlagFromIncluded is set)
+//     3. MaxPacketSize: 2 bytes (if FlagMaxPacketSizeIncluded is set)
+//     4. OfflineSignature: variable length (if FlagOfflineSignature is set)
+//     5. Signature: variable length 40-512 bytes (if FlagSignatureIncluded is set)
 //   - Payload: variable length (everything remaining after options)
 //
 // Returns an error if the data is too short or malformed.
@@ -600,21 +622,28 @@ func (p *Packet) unmarshalHeader(data []byte) (offset int, optionsEnd int, err e
 }
 
 // unmarshalOptions parses all optional fields from the packet data.
+// Per I2P streaming spec, option data order is:
+//  1. DELAY_REQUESTED (2 bytes)
+//  2. FROM_INCLUDED (variable length destination)
+//  3. MAX_PACKET_SIZE_INCLUDED (2 bytes)
+//  4. OFFLINE_SIGNATURE (variable length)
+//  5. SIGNATURE_INCLUDED (variable length)
 func (p *Packet) unmarshalOptions(data []byte, offset, optionsEnd int) error {
 	var err error
+	// Parse options in spec order: DELAY (1) -> FROM (2) -> MAX_PACKET_SIZE (3) -> OFFLINE_SIG (4) -> SIGNATURE (5)
 	if offset, err = p.unmarshalOptionalDelay(data, offset, optionsEnd); err != nil {
-		return err
-	}
-	if offset, err = p.unmarshalMaxPacketSize(data, offset, optionsEnd); err != nil {
 		return err
 	}
 	if offset, err = p.unmarshalFromDestination(data, offset, optionsEnd); err != nil {
 		return err
 	}
-	if offset, err = p.unmarshalSignature(data, offset, optionsEnd); err != nil {
+	if offset, err = p.unmarshalMaxPacketSize(data, offset, optionsEnd); err != nil {
 		return err
 	}
-	if _, err = p.unmarshalOfflineSignature(data, offset, optionsEnd); err != nil {
+	if offset, err = p.unmarshalOfflineSignature(data, offset, optionsEnd); err != nil {
+		return err
+	}
+	if _, err = p.unmarshalSignature(data, offset, optionsEnd); err != nil {
 		return err
 	}
 	return nil

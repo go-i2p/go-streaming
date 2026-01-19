@@ -240,16 +240,17 @@ func TestHandleIncomingPacket_UpdatesAckThrough(t *testing.T) {
 	defer conn.Close()
 
 	conn.mu.Lock()
-	expectedSeq := conn.recvSeq
 	oldAckThrough := conn.ackThrough
 	conn.mu.Unlock()
 
+	// Per I2P streaming spec: Plain ACK packets have sequenceNum=0 and no SYN flag
+	// This is how acknowledgments are sent without data
 	pkt := &Packet{
 		SendStreamID: uint32(conn.remotePort),
 		RecvStreamID: uint32(conn.localPort),
-		SequenceNum:  expectedSeq,
+		SequenceNum:  0,  // Plain ACK: sequenceNum=0, no SYN flag
 		AckThrough:   42, // Remote acknowledges our seq 42
-		Flags:        0, // No flags needed - ackThrough always valid per spec
+		Flags:        0,  // No flags needed - ackThrough always valid per spec
 		Payload:      nil,
 	}
 

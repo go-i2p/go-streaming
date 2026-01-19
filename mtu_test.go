@@ -8,14 +8,17 @@ import (
 )
 
 // TestMTUNegotiation_Flags verifies MTU-related packet flags.
+// Per I2P streaming spec, flag bit positions are:
+// - Bit 6: DELAY_REQUESTED = 0x40 (1 << 6)
+// - Bit 7: MAX_PACKET_SIZE_INCLUDED = 0x80 (1 << 7)
 func TestMTUNegotiation_Flags(t *testing.T) {
 	tests := []struct {
 		name          string
 		flag          uint16
 		expectedValue uint16
 	}{
-		{"FlagDelayRequested", FlagDelayRequested, 1 << 8},
-		{"FlagMaxPacketSizeIncluded", FlagMaxPacketSizeIncluded, 1 << 9},
+		{"FlagDelayRequested", FlagDelayRequested, 1 << 6},               // Bit 6 per spec
+		{"FlagMaxPacketSizeIncluded", FlagMaxPacketSizeIncluded, 1 << 7}, // Bit 7 per spec
 	}
 
 	for _, tt := range tests {
