@@ -222,6 +222,11 @@ type StreamConn struct {
 	// Maps sequence number to sent packet info for unacknowledged packets
 	sentPackets map[uint32]*sentPacket // Packets we've sent but not yet ACKed
 
+	// NACK count tracking for fast retransmit
+	// Per I2P spec: "Two NACKs of a packet is a request for a 'fast retransmit'"
+	// Only retransmit after receiving FastRetransmitThreshold (2) NACKs for same sequence
+	nackCounts map[uint32]int // Maps sequence number to NACK count received
+
 	// Simple byte buffers for MVP
 	// Using github.com/armon/circbuf for receive buffer to avoid wraparound bugs
 	sendBuf []byte
@@ -306,6 +311,10 @@ const (
 	// MaxRTO is the maximum retransmission timeout.
 	// Per I2P streaming spec: MAX_RESEND_DELAY = 60 seconds.
 	MaxRTO = 60 * time.Second
+
+	// FastRetransmitThreshold is the number of NACKs required before fast retransmit.
+	// Per I2P streaming spec: "Two NACKs of a packet is a request for a 'fast retransmit'"
+	FastRetransmitThreshold = 2
 )
 
 // Dial initiates a connection to the specified I2P destination.
@@ -431,6 +440,10 @@ func initializeStreamConn(session *go_i2cp.Session, manager *StreamManager, dest
 		state:             StateInit,
 		localMTU:          uint16(mtu),
 		remoteMTU:         0, // Will be negotiated
+		sentPackets:       make(map[uint32]*sentPacket),
+		nackCounts:        make(map[uint32]int),
+		outOfOrderPackets: make(map[uint32]*Packet),
+		nackList:          make(map[uint32]struct{}),
 		lastActivity:      time.Now(),
 		inactivityTimeout: DefaultInactivityTimeout,
 	}
@@ -497,7 +510,9 @@ func completeHandshake(conn *StreamConn, timeout time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("wait for SYN-ACK: %w", err)
 	}
-	conn.processSynAck(synAck)
+	if err := conn.processSynAck(synAck); err != nil {
+		return fmt.Errorf("process SYN-ACK: %w", err)
+	}
 
 	if err := conn.sendACK(); err != nil {
 		return fmt.Errorf("send ACK: %w", err)
@@ -655,17 +670,67 @@ func (s *StreamConn) logIgnoredPacket(pkt *Packet) {
 		Msg("received non-SYN-ACK packet while waiting, ignoring")
 }
 
-// processSynAck extracts information from SYN-ACK packet.
+// processSynAck validates and extracts information from SYN-ACK packet.
 // Sets remote sequence number, negotiates MTU, and initializes ackThrough.
-func (s *StreamConn) processSynAck(pkt *Packet) {
+//
+// Per I2P streaming spec (Setup section), validates:
+//   - AckThrough acknowledges our SYN (must equal our sendSeq)
+//   - Remote sequence number (peer's ISN) is valid
+//
+// Returns error if validation fails, which indicates a potentially malicious
+// or malformed SYN-ACK that should not be processed.
+func (s *StreamConn) processSynAck(pkt *Packet) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Validate AckThrough acknowledges our SYN packet
+	// Per spec, the peer should ACK our initial sequence number
+	if err := s.validateSynAckAckThrough(pkt); err != nil {
+		return err
+	}
+
+	// Validate the remote's sequence number (their ISN)
+	// This provides additional security by detecting anomalous values
+	s.validateRemoteSequenceNum(pkt)
 
 	s.recvSeq = pkt.SequenceNum + 1
 	s.remoteStreamID = pkt.SendStreamID
 	s.ackThrough = pkt.AckThrough
 	s.extractRemoteMTUFromSynAck(pkt)
 	s.logSynAckProcessed(pkt)
+	return nil
+}
+
+// validateSynAckAckThrough checks that the SYN-ACK acknowledges our SYN.
+// The peer's AckThrough must equal our original SYN sequence number (sendSeq - 1,
+// because sendSeq was incremented after sending the SYN). This confirms they
+// received our SYN packet and prevents accepting SYN-ACKs from unrelated
+// connections or replay attacks.
+func (s *StreamConn) validateSynAckAckThrough(pkt *Packet) error {
+	// Our SYN was sent with SequenceNum = sendSeq - 1 (sendSeq was incremented after send)
+	expectedAck := s.sendSeq - 1
+	if pkt.AckThrough != expectedAck {
+		log.Warn().
+			Uint32("expected", expectedAck).
+			Uint32("received", pkt.AckThrough).
+			Msg("SYN-ACK AckThrough does not match our SYN sequence")
+		return fmt.Errorf("invalid SYN-ACK: expected AckThrough=%d, got %d", expectedAck, pkt.AckThrough)
+	}
+	return nil
+}
+
+// validateRemoteSequenceNum checks if the peer's ISN is reasonable.
+// While any 32-bit value is technically valid, a sequence number of 0
+// is statistically unlikely (1 in 2^32) for a legitimate random ISN.
+// We log a warning but don't reject, as 0 is technically possible.
+func (s *StreamConn) validateRemoteSequenceNum(pkt *Packet) {
+	if pkt.SequenceNum == 0 {
+		// Sequence 0 is unusual for a randomly generated ISN (1 in 2^32 chance)
+		// but technically valid, so we warn but don't reject
+		log.Warn().
+			Uint32("remoteStreamID", pkt.SendStreamID).
+			Msg("SYN-ACK has sequence number 0; unusual for random ISN but accepting")
+	}
 }
 
 // extractRemoteMTUFromSynAck extracts and negotiates MTU from the SYN-ACK packet.
@@ -1020,6 +1085,7 @@ func (l *StreamListener) initConnectionState(synPkt *Packet, remotePort uint16, 
 		localMTU:          l.localMTU,
 		remoteMTU:         extractRemoteMTU(synPkt, l.localMTU),
 		sentPackets:       make(map[uint32]*sentPacket),
+		nackCounts:        make(map[uint32]int),
 		outOfOrderPackets: make(map[uint32]*Packet),
 		nackList:          make(map[uint32]struct{}),
 		lastActivity:      time.Now(),
@@ -2162,16 +2228,69 @@ func (s *StreamConn) updateCongestionWindow() {
 }
 
 // handleNACKsLocked processes NACKs and triggers retransmissions.
+// Per I2P spec: "Two NACKs of a packet is a request for a 'fast retransmit'"
+// We track NACK counts per sequence and only trigger retransmission when
+// the count reaches FastRetransmitThreshold (2).
 // Must be called with s.mu held.
 func (s *StreamConn) handleNACKsLocked(nacks []uint32) {
 	if len(nacks) == 0 {
 		return
 	}
 
+	// Initialize nackCounts map if nil (for backward compatibility with tests)
+	if s.nackCounts == nil {
+		s.nackCounts = make(map[uint32]int)
+	}
+
 	log.Debug().
 		Int("nackCount", len(nacks)).
 		Msg("processing NACK requests")
 
+	// Track which sequences triggered fast retransmit this round
+	retransmitTriggered := false
+
+	for _, nackSeq := range nacks {
+		// Increment NACK count for this sequence
+		s.nackCounts[nackSeq]++
+		count := s.nackCounts[nackSeq]
+
+		log.Debug().
+			Uint32("seq", nackSeq).
+			Int("nackCount", count).
+			Int("threshold", FastRetransmitThreshold).
+			Msg("received NACK for sequence")
+
+		// Only trigger fast retransmit after receiving threshold NACKs
+		if count >= FastRetransmitThreshold {
+			if !retransmitTriggered {
+				// Only reduce window once per batch of NACKs (on first retransmit)
+				retransmitTriggered = true
+				s.reduceCongestionWindowLocked()
+			}
+
+			if err := s.retransmitPacketLocked(nackSeq); err != nil {
+				log.Warn().
+					Err(err).
+					Uint32("seq", nackSeq).
+					Msg("fast retransmission failed")
+			} else {
+				log.Debug().
+					Uint32("seq", nackSeq).
+					Int("nackCount", count).
+					Msg("fast retransmit triggered")
+			}
+
+			// Clear NACK count after retransmitting to avoid repeated retransmits
+			// The count will be incremented again if more NACKs are received
+			delete(s.nackCounts, nackSeq)
+		}
+	}
+}
+
+// reduceCongestionWindowLocked reduces the congestion window due to packet loss.
+// Implements the congestion avoidance response: ssthresh = cwnd/2, cwnd = ssthresh.
+// Must be called with s.mu held.
+func (s *StreamConn) reduceCongestionWindowLocked() {
 	oldCwnd := s.cwnd
 	oldSsthresh := s.ssthresh
 
@@ -2184,17 +2303,7 @@ func (s *StreamConn) handleNACKsLocked(nacks []uint32) {
 		Uint32("newCwnd", s.cwnd).
 		Uint32("oldSsthresh", oldSsthresh).
 		Uint32("newSsthresh", s.ssthresh).
-		Int("nackCount", len(nacks)).
 		Msg("congestion detected: reduced window due to packet loss")
-
-	for _, nackSeq := range nacks {
-		if err := s.retransmitPacketLocked(nackSeq); err != nil {
-			log.Warn().
-				Err(err).
-				Uint32("seq", nackSeq).
-				Msg("retransmission failed")
-		}
-	}
 }
 
 // handleOptionalDelayLocked processes the choke/unchoke mechanism.
@@ -2242,7 +2351,7 @@ func (s *StreamConn) handleAckLocked(pkt *Packet) error {
 			Msg("updated ackThrough")
 
 		s.measureRTTFromAck(pkt.AckThrough)
-		s.cleanupAckedPacketsLocked(oldAck, pkt.AckThrough)
+		s.cleanupAckedPacketsLocked(oldAck, pkt.AckThrough, pkt.NACKs)
 		s.updateCongestionWindow()
 	}
 
@@ -2546,13 +2655,22 @@ func (s *StreamConn) getNACKListSliceLocked(maxNacks int) []uint32 {
 
 // cleanupAckedPacketsLocked removes ACKed packets from the sent packet tracking.
 // This prevents unbounded memory growth by cleaning up packets that have been acknowledged.
+// Packets in the currentNACKs list are NOT cleaned up since they need retransmission.
 // Also signals sendCond to wake blocked writers waiting for window space.
 // Must be called with s.mu held.
-func (s *StreamConn) cleanupAckedPacketsLocked(oldAck, newAck uint32) {
+func (s *StreamConn) cleanupAckedPacketsLocked(oldAck, newAck uint32, currentNACKs []uint32) {
 	if s.sentPackets == nil {
 		return
 	}
+
+	// Build a set of currently NACKed sequences for O(1) lookup
+	nackSet := make(map[uint32]struct{}, len(currentNACKs))
+	for _, seq := range currentNACKs {
+		nackSet[seq] = struct{}{}
+	}
+
 	cleaned := 0
+	nackCountsCleaned := 0
 	for seq := range s.sentPackets {
 		// Use wrap-around safe comparison for sequence numbers
 		if seqLessThanOrEqual(seq, newAck) {
@@ -2560,11 +2678,28 @@ func (s *StreamConn) cleanupAckedPacketsLocked(oldAck, newAck uint32) {
 			cleaned++
 		}
 	}
-	if cleaned > 0 {
+
+	// Also clean up NACK counts for acknowledged sequences
+	// Skip sequences that are in the current NACK list - they still need retransmission
+	if s.nackCounts != nil {
+		for seq := range s.nackCounts {
+			// Don't clean up sequences that are being NACKed - they need retransmission
+			if _, isNacked := nackSet[seq]; isNacked {
+				continue
+			}
+			if seqLessThanOrEqual(seq, newAck) {
+				delete(s.nackCounts, seq)
+				nackCountsCleaned++
+			}
+		}
+	}
+
+	if cleaned > 0 || nackCountsCleaned > 0 {
 		log.Debug().
 			Uint32("oldAck", oldAck).
 			Uint32("newAck", newAck).
 			Int("cleaned", cleaned).
+			Int("nackCountsCleaned", nackCountsCleaned).
 			Int("remaining", len(s.sentPackets)).
 			Msg("cleaned up ACKed packets")
 

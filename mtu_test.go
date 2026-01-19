@@ -252,12 +252,15 @@ func TestProcessSynAck_ExtractsMTU(t *testing.T) {
 			defer conn.Close()
 
 			// Create SYN-ACK packet
+			// The test connection has sendSeq = GenerateTestISN() = 1000
+			// After SYN is sent, sendSeq would be incremented, so we simulate that state
+			// by having AckThrough = sendSeq - 1 (the original ISN in our SYN)
 			synAck := &Packet{
 				SendStreamID: 9999,                   // Peer's stream ID
 				RecvStreamID: uint32(conn.localPort), // Our stream ID (as echoed by peer)
 				SequenceNum:  5000,                   // Peer's ISN
-				AckThrough:   conn.sendSeq - 1,
-				Flags:        FlagSYN | 0, // No flags needed - ackThrough always valid per spec
+				AckThrough:   conn.sendSeq - 1,       // Must match our SYN sequence (sendSeq - 1)
+				Flags:        FlagSYN | 0,            // No flags needed - ackThrough always valid per spec
 			}
 
 			if tt.includeFlag && tt.packetMTU > 0 {
@@ -266,7 +269,8 @@ func TestProcessSynAck_ExtractsMTU(t *testing.T) {
 			}
 
 			// Process SYN-ACK
-			conn.processSynAck(synAck)
+			err := conn.processSynAck(synAck)
+			require.NoError(t, err, "processSynAck should succeed with valid AckThrough")
 
 			// Verify MTU was extracted correctly
 			assert.Equal(t, tt.expectedRemote, conn.remoteMTU, "Remote MTU should match expected value")

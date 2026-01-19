@@ -198,6 +198,8 @@ func TestChokeWithNACKsProcessesBoth(t *testing.T) {
 		sentTime:   time.Now(),
 		retryCount: 0,
 	}
+	// Pre-populate nackCounts so incoming NACK reaches fast retransmit threshold (2)
+	s.nackCounts = map[uint32]int{10: 1}
 	s.mu.Unlock()
 
 	// Packet with both choke signal and NACKs

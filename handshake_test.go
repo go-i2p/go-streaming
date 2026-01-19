@@ -338,10 +338,12 @@ func TestProcessSynAck(t *testing.T) {
 	recvBuf, err := circbuf.NewBuffer(1024)
 	require.NoError(t, err)
 
+	// Simulate state after SYN was sent: sendSeq has been incremented
+	// Original ISN was 41, sendSeq is now 42 after SYN sent
 	conn := &StreamConn{
 		localPort:  1234,
 		remotePort: 5678,
-		sendSeq:    42,
+		sendSeq:    42, // After SYN sent, this is ISN + 1
 		recvSeq:    0,
 		remoteMTU:  0,
 		recvBuf:    recvBuf,
@@ -351,17 +353,87 @@ func TestProcessSynAck(t *testing.T) {
 		SendStreamID: 5678,
 		RecvStreamID: 1234,
 		SequenceNum:  100,         // Remote ISN
-		AckThrough:   42,          // ACKing our SYN
+		AckThrough:   41,          // ACKing our SYN (must match sendSeq - 1 = original ISN)
 		Flags:        FlagSYN | 0, // No flags needed - ackThrough always valid per spec
 	}
 
-	conn.processSynAck(synAckPkt)
+	err = conn.processSynAck(synAckPkt)
+	require.NoError(t, err, "processSynAck should succeed with valid packet")
 
 	// Verify remote sequence was extracted
 	assert.Equal(t, uint32(101), conn.recvSeq, "should expect next sequence after remote ISN")
 
 	// Verify MTU was set (default for MVP)
 	assert.Equal(t, uint16(DefaultMTU), conn.remoteMTU)
+}
+
+// TestProcessSynAck_InvalidAckThrough verifies that SYN-ACK with wrong AckThrough is rejected.
+// Per ISSUE-010, the SYN-ACK's AckThrough must match our SYN's sequence number.
+func TestProcessSynAck_InvalidAckThrough(t *testing.T) {
+	recvBuf, err := circbuf.NewBuffer(1024)
+	require.NoError(t, err)
+
+	// Simulate state after SYN was sent: sendSeq has been incremented
+	// Original ISN was 41, sendSeq is now 42 after SYN sent
+	conn := &StreamConn{
+		localPort:  1234,
+		remotePort: 5678,
+		sendSeq:    42, // After SYN sent (original ISN was 41)
+		recvSeq:    0,
+		remoteMTU:  0,
+		recvBuf:    recvBuf,
+	}
+
+	synAckPkt := &Packet{
+		SendStreamID: 5678,
+		RecvStreamID: 1234,
+		SequenceNum:  100,
+		AckThrough:   99, // Wrong! Should be 41 (sendSeq - 1) to ACK our SYN
+		Flags:        FlagSYN,
+	}
+
+	err = conn.processSynAck(synAckPkt)
+	require.Error(t, err, "processSynAck should fail when AckThrough doesn't match our SYN")
+	assert.Contains(t, err.Error(), "invalid SYN-ACK")
+	assert.Contains(t, err.Error(), "AckThrough")
+
+	// Verify connection state was NOT updated
+	assert.Equal(t, uint32(0), conn.recvSeq, "recvSeq should not be updated on error")
+	assert.Equal(t, uint32(0), conn.remoteStreamID, "remoteStreamID should not be updated on error")
+}
+
+// TestProcessSynAck_ZeroSequenceNumber verifies warning is logged for seq=0.
+// While technically valid (1 in 2^32 chance for random ISN), it's unusual and logged.
+func TestProcessSynAck_ZeroSequenceNumber(t *testing.T) {
+	recvBuf, err := circbuf.NewBuffer(1024)
+	require.NoError(t, err)
+
+	// Simulate state after SYN was sent: sendSeq has been incremented
+	// Original ISN was 41, sendSeq is now 42 after SYN sent
+	conn := &StreamConn{
+		localPort:  1234,
+		remotePort: 5678,
+		sendSeq:    42, // After SYN sent (original ISN was 41)
+		recvSeq:    0,
+		remoteMTU:  0,
+		recvBuf:    recvBuf,
+	}
+
+	synAckPkt := &Packet{
+		SendStreamID: 5678,
+		RecvStreamID: 1234,
+		SequenceNum:  0,  // Zero ISN - unusual but technically valid
+		AckThrough:   41, // Correctly ACKs our SYN (sendSeq - 1)
+		Flags:        FlagSYN,
+	}
+
+	// Should succeed (just logs warning) since 0 is technically valid
+	err = conn.processSynAck(synAckPkt)
+	require.NoError(t, err, "processSynAck should accept seq=0 (warns but doesn't reject)")
+
+	// Verify connection state was updated correctly
+	assert.Equal(t, uint32(1), conn.recvSeq, "recvSeq should be 0+1=1")
+	assert.Equal(t, uint32(5678), conn.remoteStreamID)
 }
 
 // TestHandshakeTimeout verifies timeout handling in Dial.

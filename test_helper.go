@@ -142,6 +142,7 @@ func CreateTestStreamConn(t *testing.T) *StreamConn {
 		localMTU:          DefaultMTU,
 		remoteMTU:         DefaultMTU,
 		sentPackets:       make(map[uint32]*sentPacket),
+		nackCounts:        make(map[uint32]int),
 		outOfOrderPackets: make(map[uint32]*Packet),
 		nackList:          make(map[uint32]struct{}),
 	}

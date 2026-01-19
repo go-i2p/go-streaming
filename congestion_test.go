@@ -7,6 +7,7 @@ import (
 )
 
 // TestCongestionDetectionOnNACK verifies that receiving NACKs triggers congestion response
+// when the fast retransmit threshold (2 NACKs) is met.
 func TestCongestionDetectionOnNACK(t *testing.T) {
 	s := &StreamConn{
 		state:      StateEstablished,
@@ -17,6 +18,8 @@ func TestCongestionDetectionOnNACK(t *testing.T) {
 		windowSize: 16,
 	}
 	s.sentPackets = make(map[uint32]*sentPacket)
+	// Pre-populate nackCounts so the incoming NACKs reach threshold of 2
+	s.nackCounts = map[uint32]int{3: 1, 4: 1}
 
 	// Create ACK packet with NACKs indicating packet loss
 	pkt := &Packet{
@@ -24,8 +27,8 @@ func TestCongestionDetectionOnNACK(t *testing.T) {
 		RecvStreamID: 2,
 		SequenceNum:  100,
 		AckThrough:   5,
-		NACKs:        []uint32{3, 4}, // Lost packets
-		Flags:        0, // No flags needed - ackThrough always valid per spec
+		NACKs:        []uint32{3, 4}, // Lost packets (second NACK for each)
+		Flags:        0,              // No flags needed - ackThrough always valid per spec
 	}
 
 	s.mu.Lock()
@@ -47,6 +50,7 @@ func TestCongestionDetectionOnNACK(t *testing.T) {
 }
 
 // TestCongestionDetectionMultipleNACKs verifies handling of multiple lost packets
+// when fast retransmit threshold is met.
 func TestCongestionDetectionMultipleNACKs(t *testing.T) {
 	s := &StreamConn{
 		state:      StateEstablished,
@@ -57,6 +61,8 @@ func TestCongestionDetectionMultipleNACKs(t *testing.T) {
 		windowSize: 64,
 	}
 	s.sentPackets = make(map[uint32]*sentPacket)
+	// Pre-populate nackCounts so the incoming NACKs reach threshold of 2
+	s.nackCounts = map[uint32]int{5: 1, 6: 1, 7: 1, 8: 1, 9: 1}
 
 	// Multiple NACKs indicating significant packet loss
 	pkt := &Packet{
@@ -64,8 +70,8 @@ func TestCongestionDetectionMultipleNACKs(t *testing.T) {
 		RecvStreamID: 2,
 		SequenceNum:  100,
 		AckThrough:   10,
-		NACKs:        []uint32{5, 6, 7, 8, 9}, // 5 lost packets
-		Flags:        0, // No flags needed - ackThrough always valid per spec
+		NACKs:        []uint32{5, 6, 7, 8, 9}, // 5 lost packets (second NACK for each)
+		Flags:        0,                       // No flags needed - ackThrough always valid per spec
 	}
 
 	s.mu.Lock()
@@ -84,6 +90,7 @@ func TestCongestionDetectionMultipleNACKs(t *testing.T) {
 }
 
 // TestCongestionDetectionMinimumWindow verifies minimum window size of 2 packets
+// when fast retransmit threshold is met.
 func TestCongestionDetectionMinimumWindow(t *testing.T) {
 	s := &StreamConn{
 		state:      StateEstablished,
@@ -94,14 +101,16 @@ func TestCongestionDetectionMinimumWindow(t *testing.T) {
 		windowSize: 2,
 	}
 	s.sentPackets = make(map[uint32]*sentPacket)
+	// Pre-populate nackCounts so the incoming NACK reaches threshold of 2
+	s.nackCounts = map[uint32]int{3: 1}
 
 	pkt := &Packet{
 		SendStreamID: 1,
 		RecvStreamID: 2,
 		SequenceNum:  100,
 		AckThrough:   5,
-		NACKs:        []uint32{3}, // Single lost packet
-		Flags:        0, // No flags needed - ackThrough always valid per spec
+		NACKs:        []uint32{3}, // Single lost packet (second NACK)
+		Flags:        0,           // No flags needed - ackThrough always valid per spec
 	}
 
 	s.mu.Lock()
@@ -119,6 +128,7 @@ func TestCongestionDetectionMinimumWindow(t *testing.T) {
 }
 
 // TestCongestionDetectionWithSlowStart verifies interaction with slow start
+// when fast retransmit threshold is met.
 func TestCongestionDetectionWithSlowStart(t *testing.T) {
 	s := &StreamConn{
 		state:      StateEstablished,
@@ -129,6 +139,7 @@ func TestCongestionDetectionWithSlowStart(t *testing.T) {
 		windowSize: 4,
 	}
 	s.sentPackets = make(map[uint32]*sentPacket)
+	s.nackCounts = make(map[uint32]int)
 
 	// Track packets for ACK processing
 	for i := uint32(1); i <= 10; i++ {
@@ -152,14 +163,20 @@ func TestCongestionDetectionWithSlowStart(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint32(8), cwndAfterAck, "slow start should double cwnd")
 
-	// Second ACK: congestion detected (NACKs present)
+	// Pre-populate nackCounts so the incoming NACKs reach threshold of 2
+	s.mu.Lock()
+	s.nackCounts[6] = 1
+	s.nackCounts[7] = 1
+	s.mu.Unlock()
+
+	// Second ACK: congestion detected (NACKs present, threshold reached)
 	pkt2 := &Packet{
 		SendStreamID: 1,
 		RecvStreamID: 2,
 		SequenceNum:  101,
 		AckThrough:   8,
-		NACKs:        []uint32{6, 7}, // Packet loss
-		Flags:        0, // No flags needed - ackThrough always valid per spec
+		NACKs:        []uint32{6, 7}, // Packet loss (second NACK for each)
+		Flags:        0,              // No flags needed - ackThrough always valid per spec
 	}
 
 	s.mu.Lock()
@@ -179,6 +196,7 @@ func TestCongestionDetectionWithSlowStart(t *testing.T) {
 }
 
 // TestCongestionDetectionRecovery verifies recovery after congestion
+// when fast retransmit threshold is met.
 func TestCongestionDetectionRecovery(t *testing.T) {
 	s := &StreamConn{
 		state:      StateEstablished,
@@ -189,6 +207,8 @@ func TestCongestionDetectionRecovery(t *testing.T) {
 		windowSize: 32,
 	}
 	s.sentPackets = make(map[uint32]*sentPacket)
+	// Pre-populate nackCounts so the incoming NACKs reach threshold of 2
+	s.nackCounts = map[uint32]int{8: 1, 9: 1}
 
 	// Add tracked packets
 	for i := uint32(1); i <= 20; i++ {
@@ -201,8 +221,8 @@ func TestCongestionDetectionRecovery(t *testing.T) {
 		RecvStreamID: 2,
 		SequenceNum:  100,
 		AckThrough:   10,
-		NACKs:        []uint32{8, 9}, // Packet loss
-		Flags:        0, // No flags needed - ackThrough always valid per spec
+		NACKs:        []uint32{8, 9}, // Packet loss (second NACK for each)
+		Flags:        0,              // No flags needed - ackThrough always valid per spec
 	}
 
 	s.mu.Lock()
@@ -237,6 +257,7 @@ func TestCongestionDetectionRecovery(t *testing.T) {
 }
 
 // TestCongestionDetectionHighWindow verifies behavior at high window sizes
+// when fast retransmit threshold is met.
 func TestCongestionDetectionHighWindow(t *testing.T) {
 	s := &StreamConn{
 		state:      StateEstablished,
@@ -247,14 +268,16 @@ func TestCongestionDetectionHighWindow(t *testing.T) {
 		windowSize: 120,
 	}
 	s.sentPackets = make(map[uint32]*sentPacket)
+	// Pre-populate nackCounts so the incoming NACKs reach threshold of 2
+	s.nackCounts = map[uint32]int{45: 1, 46: 1, 47: 1}
 
 	pkt := &Packet{
 		SendStreamID: 1,
 		RecvStreamID: 2,
 		SequenceNum:  100,
 		AckThrough:   50,
-		NACKs:        []uint32{45, 46, 47}, // Packet loss at high window
-		Flags:        0, // No flags needed - ackThrough always valid per spec
+		NACKs:        []uint32{45, 46, 47}, // Packet loss at high window (second NACK for each)
+		Flags:        0,                    // No flags needed - ackThrough always valid per spec
 	}
 
 	s.mu.Lock()
@@ -283,6 +306,7 @@ func TestNoCongestionDetectionWithoutNACKs(t *testing.T) {
 		windowSize: 16,
 	}
 	s.sentPackets = make(map[uint32]*sentPacket)
+	s.nackCounts = make(map[uint32]int)
 
 	// Add tracked packets
 	for i := uint32(1); i <= 10; i++ {
@@ -296,7 +320,7 @@ func TestNoCongestionDetectionWithoutNACKs(t *testing.T) {
 		SequenceNum:  100,
 		AckThrough:   5,
 		NACKs:        nil, // No packet loss
-		Flags:        0, // No flags needed - ackThrough always valid per spec
+		Flags:        0,   // No flags needed - ackThrough always valid per spec
 	}
 
 	s.mu.Lock()
@@ -317,6 +341,7 @@ func TestNoCongestionDetectionWithoutNACKs(t *testing.T) {
 }
 
 // TestCongestionDetectionSingleNACK verifies response to single packet loss
+// when fast retransmit threshold is met.
 func TestCongestionDetectionSingleNACK(t *testing.T) {
 	s := &StreamConn{
 		state:      StateEstablished,
@@ -327,14 +352,16 @@ func TestCongestionDetectionSingleNACK(t *testing.T) {
 		windowSize: 50,
 	}
 	s.sentPackets = make(map[uint32]*sentPacket)
+	// Pre-populate nackCounts so the incoming NACK reaches threshold of 2
+	s.nackCounts = map[uint32]int{20: 1}
 
 	pkt := &Packet{
 		SendStreamID: 1,
 		RecvStreamID: 2,
 		SequenceNum:  100,
 		AckThrough:   25,
-		NACKs:        []uint32{20}, // Single lost packet
-		Flags:        0, // No flags needed - ackThrough always valid per spec
+		NACKs:        []uint32{20}, // Single lost packet (second NACK)
+		Flags:        0,            // No flags needed - ackThrough always valid per spec
 	}
 
 	s.mu.Lock()
@@ -353,6 +380,7 @@ func TestCongestionDetectionSingleNACK(t *testing.T) {
 }
 
 // TestCongestionDetectionEdgeCaseThree verifies cwnd=3 edge case
+// when fast retransmit threshold is met.
 func TestCongestionDetectionEdgeCaseThree(t *testing.T) {
 	s := &StreamConn{
 		state:      StateEstablished,
@@ -363,14 +391,16 @@ func TestCongestionDetectionEdgeCaseThree(t *testing.T) {
 		windowSize: 3,
 	}
 	s.sentPackets = make(map[uint32]*sentPacket)
+	// Pre-populate nackCounts so the incoming NACK reaches threshold of 2
+	s.nackCounts = map[uint32]int{4: 1}
 
 	pkt := &Packet{
 		SendStreamID: 1,
 		RecvStreamID: 2,
 		SequenceNum:  100,
 		AckThrough:   5,
-		NACKs:        []uint32{4},
-		Flags:        0, // No flags needed - ackThrough always valid per spec
+		NACKs:        []uint32{4}, // Second NACK for sequence 4
+		Flags:        0,           // No flags needed - ackThrough always valid per spec
 	}
 
 	s.mu.Lock()

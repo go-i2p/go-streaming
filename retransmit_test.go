@@ -19,6 +19,7 @@ func newTestStreamConnForRetransmit(t *testing.T) *StreamConn {
 		recvBuf:           recvBuf,
 		outOfOrderPackets: make(map[uint32]*Packet),
 		nackList:          make(map[uint32]struct{}),
+		nackCounts:        make(map[uint32]int),
 	}
 	s.recvCond = sync.NewCond(&s.mu)
 	s.sendCond = sync.NewCond(&s.mu)
@@ -168,7 +169,7 @@ func TestAckedPacketCleanup(t *testing.T) {
 
 	// ACK through packet 3
 	s.mu.Lock()
-	s.cleanupAckedPacketsLocked(0, 3)
+	s.cleanupAckedPacketsLocked(0, 3, nil)
 	remaining := len(s.sentPackets)
 	s.mu.Unlock()
 
@@ -186,7 +187,7 @@ func TestAckedPacketCleanup(t *testing.T) {
 
 	// ACK through packet 5
 	s.mu.Lock()
-	s.cleanupAckedPacketsLocked(3, 5)
+	s.cleanupAckedPacketsLocked(3, 5, nil)
 	remaining = len(s.sentPackets)
 	s.mu.Unlock()
 
@@ -199,7 +200,7 @@ func TestCleanupWithNoTrackedPackets(t *testing.T) {
 
 	// Call cleanup with no tracked packets
 	s.mu.Lock()
-	s.cleanupAckedPacketsLocked(0, 10)
+	s.cleanupAckedPacketsLocked(0, 10, nil)
 	s.mu.Unlock()
 
 	// Should not panic or error
@@ -269,7 +270,7 @@ func TestNACKAfterPartialACK(t *testing.T) {
 
 	// ACK through packet 2, NACK packet 1 (should already be cleaned)
 	s.mu.Lock()
-	s.cleanupAckedPacketsLocked(0, 2)
+	s.cleanupAckedPacketsLocked(0, 2, nil)
 	err := s.retransmitPacketLocked(1) // Already ACKed
 	s.mu.Unlock()
 
