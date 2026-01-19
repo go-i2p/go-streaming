@@ -19,10 +19,11 @@ import (
 //   - Routes incoming messages (protocol 6) to connections
 //   - Manages connection multiplexing by port
 //   - Handles new incoming connections for listeners
+//   - Handles ping/pong (ECHO) packets per I2P streaming spec
 //
 // Why a manager is needed:
 //   - I2CP delivers messages via callbacks, not polling
-//   - Multiple connections share a single I2CP session
+//   - Multiple connections share a single I2P session
 //   - Need to route packets to correct connection by port
 //   - Server needs to accept new connections from SYN packets
 type StreamManager struct {
@@ -33,6 +34,9 @@ type StreamManager struct {
 	// Map of localPort -> *StreamListener or *StreamConn
 	listeners   sync.Map // map[uint16]*StreamListener
 	connections sync.Map // map[connKey]*StreamConn
+
+	// Ping/pong handling
+	pingMgr *pingManager
 
 	// Packet processing
 	incomingPackets chan *incomingPacket
@@ -98,6 +102,9 @@ func NewStreamManager(client *go_i2cp.Client) (*StreamManager, error) {
 		processorCtx:    ctx,
 		processorCancel: cancel,
 	}
+
+	// Initialize ping manager with default config
+	sm.pingMgr = newPingManager(sm, DefaultPingConfig())
 
 	// Create I2CP session with callbacks
 	callbacks := go_i2cp.SessionCallbacks{
@@ -421,6 +428,7 @@ func (sm *StreamManager) processPackets() {
 
 // dispatchPacket routes a packet to the appropriate handler.
 // This unmarshals the packet and checks for:
+//  0. ECHO packets (ping/pong) - handled specially per I2P streaming spec
 //  1. Listener on destPort (for new connections - SYN packets)
 //  2. Existing connection (for established connections)
 //  3. Unknown destination (drop packet or send RESET)
@@ -431,6 +439,14 @@ func (sm *StreamManager) dispatchPacket(incoming *incomingPacket) {
 	}
 
 	sm.logDispatchingPacket(pkt, incoming)
+
+	// Per spec: "if the ECHO option is set, then most other flags, options,
+	// ackThrough, sequenceNum, NACKs, etc. are ignored."
+	// Handle ECHO packets before any other routing.
+	if pkt.Flags&FlagECHO != 0 {
+		sm.handleEchoPacket(pkt, incoming)
+		return
+	}
 
 	if sm.isSynPacket(pkt) {
 		sm.handleSynPacket(pkt, incoming)
@@ -464,6 +480,72 @@ func (sm *StreamManager) logDispatchingPacket(pkt *Packet, incoming *incomingPac
 // have SendStreamID > 0.
 func (sm *StreamManager) isSynPacket(pkt *Packet) bool {
 	return pkt.Flags&FlagSYN != 0 && pkt.SendStreamID == 0
+}
+
+// handleEchoPacket handles ping and pong packets per I2P streaming spec.
+// Per spec:
+//   - Ping: ECHO flag set, sendStreamId > 0 (response with pong)
+//   - Pong: ECHO flag set, sendStreamId == 0 (resolve pending ping)
+func (sm *StreamManager) handleEchoPacket(pkt *Packet, incoming *incomingPacket) {
+	if isPingPacket(pkt) {
+		log.Debug().
+			Uint32("streamID", pkt.SendStreamID).
+			Int("payloadLen", len(pkt.Payload)).
+			Msg("received ping")
+		sm.pingMgr.handlePing(pkt, incoming.srcDest, incoming.srcPort, incoming.destPort)
+	} else if isPongPacket(pkt) {
+		log.Debug().
+			Uint32("streamID", pkt.RecvStreamID).
+			Int("payloadLen", len(pkt.Payload)).
+			Msg("received pong")
+		sm.pingMgr.handlePong(pkt)
+	} else {
+		log.Debug().
+			Uint16("flags", pkt.Flags).
+			Uint32("sendStreamID", pkt.SendStreamID).
+			Msg("received ECHO packet with unexpected format")
+	}
+}
+
+// Ping sends a ping packet to the specified destination and waits for a pong response.
+// This implements the I2P streaming ping/pong mechanism per specification.
+//
+// Per spec:
+//   - A ping packet has ECHO, SIGNATURE_INCLUDED, and FROM_INCLUDED flags set
+//   - The sendStreamId must be greater than zero
+//   - Payload up to 32 bytes is echoed back in the pong
+//
+// Example:
+//
+//	result := manager.Ping(ctx, destination, []byte("hello"))
+//	if result.Err != nil {
+//	    log.Error().Err(result.Err).Msg("ping failed")
+//	} else {
+//	    log.Info().Dur("rtt", result.RTT).Msg("ping successful")
+//	}
+func (sm *StreamManager) Ping(ctx context.Context, dest *go_i2cp.Destination, payload []byte) *PingResult {
+	return sm.pingMgr.Ping(ctx, dest, payload)
+}
+
+// SetPingConfig updates the ping configuration.
+// Use this to enable/disable answering pings or adjust timeout.
+func (sm *StreamManager) SetPingConfig(config *PingConfig) {
+	if config == nil {
+		config = DefaultPingConfig()
+	}
+	sm.pingMgr.mu.Lock()
+	sm.pingMgr.config = config
+	sm.pingMgr.mu.Unlock()
+}
+
+// GetPingConfig returns a copy of the current ping configuration.
+func (sm *StreamManager) GetPingConfig() *PingConfig {
+	sm.pingMgr.mu.Lock()
+	defer sm.pingMgr.mu.Unlock()
+	return &PingConfig{
+		AnswerPings: sm.pingMgr.config.AnswerPings,
+		PingTimeout: sm.pingMgr.config.PingTimeout,
+	}
 }
 
 // handleSynPacket handles a SYN packet by routing to a listener or sending RESET.

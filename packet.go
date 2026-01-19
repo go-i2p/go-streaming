@@ -54,8 +54,9 @@ const (
 	FlagProfileInteractive uint16 = 1 << 8
 
 	// FlagECHO (bit 9): Ping/pong packet.
-	// NOTE: This flag is defined per I2P streaming spec but NOT FULLY IMPLEMENTED.
 	// If set, most other options are ignored.
+	// Ping: sendStreamId > 0, requires SIGNATURE_INCLUDED and FROM_INCLUDED
+	// Pong: sendStreamId = 0, receiveStreamId echoes ping's sendStreamId
 	FlagECHO uint16 = 1 << 9
 
 	// FlagNoACK (bit 10): Tells the recipient to ignore the ackThrough field.

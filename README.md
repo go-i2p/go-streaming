@@ -55,6 +55,7 @@ The library is stable and production-ready for I2P applications. All core stream
 - ✅ Packet-based flow control (6-packet initial window, up to 128 packets)
 - ✅ Exponential backoff retransmission
 - ✅ Out-of-order packet buffering
+- ✅ Ping/Pong (ECHO) for connection testing and RTT measurement
 - ✅ **StreamManager** for automatic packet routing from I2CP callbacks
 - ✅ **Connection multiplexing** on single I2CP session
 - ✅ **172 unit tests** with 68.0% coverage, race-free
@@ -67,7 +68,6 @@ The library is stable and production-ready for I2P applications. All core stream
 
 - **Simple retransmission**: Fixed exponential backoff (no RFC 6298 SRTT smoothing)
 - **Slow start implemented**: Basic congestion control (not TCP-optimized)
-- **No ECHO packets**: Ping/pong not implemented (relies on I2CP timeouts)
 - **Limited RST**: Connection resets are basic
 - **No half-close**: Use CLOSE for termination
 - **No profile support**: Bulk vs. interactive profiles not implemented
