@@ -1871,10 +1871,14 @@ func (s *StreamConn) logProcessingPacket(pkt *Packet) {
 
 // dispatchPacketByFlags routes the packet to the appropriate handler based on flags.
 // Per I2P streaming spec:
-// - There is no explicit ACK flag; ackThrough is always valid unless NO_ACK is set
-// - SYN-ACK is identified by SYN flag + SendStreamID > 0
-// - Plain ACK is identified by sequenceNum=0 and no SYN flag
-// Note: Order matters! More specific cases first.
+//   - There is no explicit ACK flag; ackThrough is always valid unless NO_ACK is set
+//   - SYN-ACK is identified by SYN flag + SendStreamID > 0
+//   - Plain ACK is identified by sequenceNum=0 and no SYN flag (per spec: "If the
+//     sequenceNum is 0 and the SYN flag is not set, this is a plain ACK packet that
+//     should not be ACKed.")
+//
+// Note: Order matters! More specific cases first. Plain ACK must be checked before
+// data payload to ensure packets with seq=0 are handled correctly.
 func (s *StreamConn) dispatchPacketByFlags(pkt *Packet) error {
 	switch {
 	case pkt.Flags&FlagSYN != 0 && pkt.SendStreamID > 0:
@@ -1887,11 +1891,14 @@ func (s *StreamConn) dispatchPacketByFlags(pkt *Packet) error {
 		return s.handleCloseLocked(pkt)
 	case pkt.Flags&FlagRESET != 0:
 		return s.handleResetLocked(pkt)
+	case pkt.SequenceNum == 0 && pkt.Flags&FlagSYN == 0:
+		// Per spec: sequenceNum=0 without SYN = plain ACK packet.
+		// Plain ACK packets should NOT be ACKed back. handleAckLocked does not
+		// send an ACK, which is correct. This case must be checked BEFORE the
+		// data payload case to handle plain ACK packets with any payload correctly.
+		return s.handleAckLocked(pkt)
 	case len(pkt.Payload) > 0:
 		return s.handleDataLocked(pkt)
-	case pkt.SequenceNum == 0 && pkt.Flags&FlagSYN == 0:
-		// Per spec: sequenceNum=0 without SYN = plain ACK packet
-		return s.handleAckLocked(pkt)
 	default:
 		log.Debug().Uint16("flags", pkt.Flags).Msg("packet with no recognized flags")
 	}
