@@ -3,6 +3,7 @@ package streaming
 import (
 	"encoding/binary"
 	"testing"
+	"time"
 
 	go_i2cp "github.com/go-i2p/go-i2cp"
 	"github.com/stretchr/testify/assert"
@@ -53,6 +54,17 @@ func TestConstants(t *testing.T) {
 			assert.Equal(t, tt.want, tt.got, tt.name)
 		})
 	}
+}
+
+// TestRTOConstants verifies RTO constants match I2P streaming spec.
+func TestRTOConstants(t *testing.T) {
+	t.Run("MinRTO is 100ms per spec", func(t *testing.T) {
+		assert.Equal(t, 100*time.Millisecond, MinRTO, "MinRTO should be 100ms per I2P streaming spec")
+	})
+
+	t.Run("MaxRTO is 60s per spec", func(t *testing.T) {
+		assert.Equal(t, 60*time.Second, MaxRTO, "MaxRTO should be 60 seconds per I2P streaming spec")
+	})
 }
 
 // TestHashDestination tests the destination hashing function for replay prevention.

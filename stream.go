@@ -298,6 +298,14 @@ const (
 
 	// InactivityCheckInterval is how often the inactivity timer checks for timeout.
 	InactivityCheckInterval = 10 * time.Second
+
+	// MinRTO is the minimum retransmission timeout.
+	// Per I2P streaming spec: MIN_RESEND_DELAY = 100ms.
+	MinRTO = 100 * time.Millisecond
+
+	// MaxRTO is the maximum retransmission timeout.
+	// Per I2P streaming spec: MAX_RESEND_DELAY = 60 seconds.
+	MaxRTO = 60 * time.Second
 )
 
 // Dial initiates a connection to the specified I2P destination.
@@ -409,12 +417,12 @@ func initializeStreamConn(session *go_i2cp.Session, manager *StreamManager, dest
 		localStreamID:     localStreamID,
 		remoteStreamID:    0, // Will be set from SYN-ACK
 		sendSeq:           isn,
-		recvSeq:           0,               // Will be set from SYN-ACK
-		windowSize:        1,               // Start with slow start at 1 packet
-		cwnd:              1,               // Congestion window starts at 1
-		ssthresh:          MaxWindowSize,   // Slow start threshold at max (128 packets)
-		rtt:               8 * time.Second, // Initial RTT estimate
-		rto:               9 * time.Second, // Initial RTO per spec
+		recvSeq:           0,                 // Will be set from SYN-ACK
+		windowSize:        DefaultWindowSize, // Per spec: initial window is 6 packets
+		cwnd:              DefaultWindowSize, // Congestion window starts at 6
+		ssthresh:          MaxWindowSize,     // Slow start threshold at max (128 packets)
+		rtt:               8 * time.Second,   // Initial RTT estimate
+		rto:               9 * time.Second,   // Initial RTO per spec
 		recvBuf:           recvBuf,
 		recvChan:          make(chan *Packet, 32), // Buffer for incoming packets
 		errChan:           make(chan error, 1),
@@ -998,8 +1006,8 @@ func (l *StreamListener) initConnectionState(synPkt *Packet, remotePort uint16, 
 		remoteStreamID:    synPkt.RecvStreamID,
 		sendSeq:           isn,
 		recvSeq:           synPkt.SequenceNum + 1,
-		windowSize:        1,
-		cwnd:              1,
+		windowSize:        DefaultWindowSize, // Per spec: initial window is 6 packets
+		cwnd:              DefaultWindowSize, // Congestion window starts at 6
 		ssthresh:          MaxWindowSize,
 		rtt:               8 * time.Second,
 		rto:               9 * time.Second,
@@ -2069,18 +2077,16 @@ func (s *StreamConn) updateRTTEstimate(rtt time.Duration) {
 }
 
 // calculateRTO calculates and sets the retransmission timeout.
+// Uses MinRTO (100ms) and MaxRTO (60s) bounds per I2P streaming spec.
 // Must be called with s.mu held.
 func (s *StreamConn) calculateRTO() {
 	s.rto = s.srtt + 4*s.rttVariance
 
-	const minRTO = 1 * time.Second
-	const maxRTO = 60 * time.Second
-
-	if s.rto < minRTO {
-		s.rto = minRTO
+	if s.rto < MinRTO {
+		s.rto = MinRTO
 	}
-	if s.rto > maxRTO {
-		s.rto = maxRTO
+	if s.rto > MaxRTO {
+		s.rto = MaxRTO
 	}
 
 	log.Debug().

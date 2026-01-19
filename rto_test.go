@@ -53,12 +53,12 @@ func TestRTOFirstMeasurement(t *testing.T) {
 	require.Equal(t, rtt/2, rttVar, "RTTVAR should be RTT/2 for first measurement")
 
 	// RTO = SRTT + 4*RTTVAR = RTT + 4*(RTT/2) = 3*RTT
-	// However, RFC 6298 enforces a minimum RTO of 1 second
+	// Per I2P streaming spec, minimum RTO is 100ms
 	expectedRTO := rtt + 4*rttVar
-	if expectedRTO < 1*time.Second {
-		expectedRTO = 1 * time.Second
+	if expectedRTO < MinRTO {
+		expectedRTO = MinRTO
 	}
-	require.Equal(t, expectedRTO, rto, "RTO should be SRTT + 4*RTTVAR (with 1s minimum)")
+	require.Equal(t, expectedRTO, rto, "RTO should be SRTT + 4*RTTVAR (with 100ms minimum)")
 }
 
 // TestRTOSubsequentMeasurements verifies exponential weighted moving average
@@ -160,7 +160,7 @@ func TestRTOMinimumBound(t *testing.T) {
 	s.mu.Unlock()
 
 	require.NoError(t, err)
-	require.Equal(t, 1*time.Second, rto, "RTO should be at least 1 second")
+	require.Equal(t, MinRTO, rto, "RTO should be at least 100ms per I2P streaming spec")
 }
 
 // TestRTOMaximumBound verifies RTO maximum of 60 seconds
@@ -322,11 +322,11 @@ func TestRTOFormula(t *testing.T) {
 
 	// Verify RTO calculation (allowing for min/max bounds)
 	expectedRTO := srtt + 4*rttVar
-	if expectedRTO < 1*time.Second {
-		expectedRTO = 1 * time.Second
+	if expectedRTO < MinRTO {
+		expectedRTO = MinRTO
 	}
-	if expectedRTO > 60*time.Second {
-		expectedRTO = 60 * time.Second
+	if expectedRTO > MaxRTO {
+		expectedRTO = MaxRTO
 	}
 
 	require.Equal(t, expectedRTO, rto, "RTO should equal SRTT + 4*RTTVAR (within bounds)")
