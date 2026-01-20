@@ -3211,6 +3211,26 @@ func (s *StreamConn) getNegotiatedMTULocked() uint16 {
 //
 // Phase 5: Implements proper CLOSE handshake per I2P streaming spec.
 // CLOSE is distinct from FIN - it's a bidirectional handshake.
+//
+// Half-Close Behavior:
+// Unlike TCP, I2P streaming does NOT support true half-close semantics.
+// Per the I2P streaming specification: "The connection is not closed until
+// the peer responds with the CLOSE flag."
+//
+// When Close() is called:
+//  1. A CLOSE packet is sent to the peer
+//  2. The connection state transitions to StateClosing
+//  3. Local resources are cleaned up immediately (TCB saved to cache)
+//
+// Note: This implementation does not wait for the peer's CLOSE acknowledgment
+// before returning. This is intentional for simplicity, but means:
+//   - Data in flight may not be delivered
+//   - Use SetWriteDeadline before Close() if delivery is critical
+//   - Consider sending all data and waiting for ACKs before closing
+//
+// Java I2P reference: ConnectionPacketHandler.java "this is fine, half-close"
+// indicates that half-close was a "major bug before 0.9.9" where packets were
+// dropped and resets sent. The current go-streaming behavior is correct.
 func (s *StreamConn) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

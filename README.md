@@ -66,13 +66,24 @@ The library is stable and production-ready for I2P applications. All core stream
 
 ### Known Limitations ⚠️
 
-- **Simple retransmission**: Fixed exponential backoff (no RFC 6298 SRTT smoothing)
-- **Slow start implemented**: Basic congestion control (not TCP-optimized)
 - **Limited RST**: Connection resets are basic
-- **No half-close**: Use CLOSE for termination
+- **No half-close**: I2P streaming requires bidirectional CLOSE (see below)
 - **No profile support**: Bulk vs. interactive profiles not implemented
 
 These are intentional MVP trade-offs for clarity. Future versions will add optimizations based on real-world usage.
+
+### Half-Close Behavior
+
+Unlike TCP, I2P streaming does not support true half-close semantics where one side can close its write stream while continuing to read. Per the I2P streaming specification:
+
+> "The connection is not closed until the peer responds with the CLOSE flag."
+
+Both sides must send CLOSE to fully terminate a connection. When you call `Close()`, go-streaming:
+1. Sends a CLOSE packet
+2. Waits for the peer's CLOSE acknowledgment
+3. Cleans up resources
+
+Use `SetWriteDeadline` or `SetDeadline` if you need to timeout during close.
 
 ## Examples
 
