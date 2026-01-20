@@ -71,7 +71,7 @@ func TestEndToEnd_PacketRoundTrip(t *testing.T) {
 				RecvStreamID: 8080,
 				SequenceNum:  2000,
 				AckThrough:   5000,
-				Flags:        0, // No flags needed - ackThrough always valid per spec
+				Flags:        0,                  // No flags needed - ackThrough always valid per spec
 				Payload:      make([]byte, 1024), // 1KB
 			},
 		},
@@ -267,7 +267,7 @@ func TestEndToEnd_ConnectionMultiplexing(t *testing.T) {
 			RecvStreamID: uint32(conn.localPort),
 			SequenceNum:  5000, // Match current recvSeq
 			AckThrough:   1000,
-			Flags:        0, // No flags needed - ackThrough always valid per spec
+			Flags:        0,                                    // No flags needed - ackThrough always valid per spec
 			Payload:      []byte{byte('A' + i), byte('0' + i)}, // Unique data
 		}
 
@@ -913,7 +913,7 @@ func TestSequenceNumbering(t *testing.T) {
 				RecvStreamID: 2,
 				SequenceNum:  baseSeq,
 				AckThrough:   999,
-				Flags:        0, // No flags needed - ackThrough always valid per spec
+				Flags:        0,               // No flags needed - ackThrough always valid per spec
 				Payload:      []byte("small"), // 5 bytes
 			},
 			{
@@ -921,7 +921,7 @@ func TestSequenceNumbering(t *testing.T) {
 				RecvStreamID: 2,
 				SequenceNum:  baseSeq + 1, // Increment by 1, not payload size
 				AckThrough:   999,
-				Flags:        0, // No flags needed - ackThrough always valid per spec
+				Flags:        0,                  // No flags needed - ackThrough always valid per spec
 				Payload:      make([]byte, 1024), // 1024 bytes
 			},
 			{
@@ -929,7 +929,7 @@ func TestSequenceNumbering(t *testing.T) {
 				RecvStreamID: 2,
 				SequenceNum:  baseSeq + 2, // Still increment by 1
 				AckThrough:   999,
-				Flags:        0, // No flags needed - ackThrough always valid per spec
+				Flags:        0,           // No flags needed - ackThrough always valid per spec
 				Payload:      []byte("x"), // 1 byte
 			},
 		}
@@ -964,7 +964,7 @@ func TestSequenceNumbering(t *testing.T) {
 			RecvStreamID: 1,
 			SequenceNum:  200,
 			AckThrough:   100, // Ack packet 1
-			Flags:        0, // No flags needed - ackThrough always valid per spec
+			Flags:        0,   // No flags needed - ackThrough always valid per spec
 		}
 
 		// Packet 3 acknowledging packet 2
@@ -973,7 +973,7 @@ func TestSequenceNumbering(t *testing.T) {
 			RecvStreamID: 2,
 			SequenceNum:  101, // Next sequence
 			AckThrough:   200, // Ack packet 2
-			Flags:        0, // No flags needed - ackThrough always valid per spec
+			Flags:        0,   // No flags needed - ackThrough always valid per spec
 		}
 
 		for i, pkt := range []*Packet{pkt1, pkt2, pkt3} {
@@ -1007,7 +1007,7 @@ func TestSequenceNumbering(t *testing.T) {
 			SendStreamID: 67890,
 			RecvStreamID: 12345,
 			SequenceNum:  5000,
-			AckThrough:   isn, // Ack the SYN
+			AckThrough:   isn,         // Ack the SYN
 			Flags:        FlagSYN | 0, // No flags needed - ackThrough always valid per spec
 		}
 
@@ -1017,7 +1017,7 @@ func TestSequenceNumbering(t *testing.T) {
 			RecvStreamID: 67890,
 			SequenceNum:  isn + 1, // SYN consumes one sequence number
 			AckThrough:   5000,    // Ack the SYN-ACK
-			Flags:        0, // No flags needed - ackThrough always valid per spec
+			Flags:        0,       // No flags needed - ackThrough always valid per spec
 		}
 
 		// Data packets continue incrementing

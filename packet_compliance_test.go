@@ -221,7 +221,7 @@ func TestResendDelayFieldSize(t *testing.T) {
 			SendStreamID: 1,
 			RecvStreamID: 2,
 			SequenceNum:  100,
-			Flags:        0, // No flags needed - ackThrough always valid per spec
+			Flags:        0,   // No flags needed - ackThrough always valid per spec
 			ResendDelay:  255, // Max value for uint8
 		}
 
@@ -398,7 +398,7 @@ func TestSequenceNumberIncrement(t *testing.T) {
 			SendStreamID: 1,
 			RecvStreamID: 2,
 			SequenceNum:  1000,
-			Flags:        0, // No flags needed - ackThrough always valid per spec
+			Flags:        0,               // No flags needed - ackThrough always valid per spec
 			Payload:      []byte("small"), // 5 bytes
 		}
 
@@ -406,8 +406,8 @@ func TestSequenceNumberIncrement(t *testing.T) {
 		pkt2 := &Packet{
 			SendStreamID: 1,
 			RecvStreamID: 2,
-			SequenceNum:  1001, // Incremented by 1, not by payload size
-			Flags:        0, // No flags needed - ackThrough always valid per spec
+			SequenceNum:  1001,               // Incremented by 1, not by payload size
+			Flags:        0,                  // No flags needed - ackThrough always valid per spec
 			Payload:      make([]byte, 1024), // 1024 bytes
 		}
 
@@ -422,7 +422,7 @@ func TestSequenceNumberIncrement(t *testing.T) {
 			RecvStreamID: 2,
 			SequenceNum:  500,
 			AckThrough:   499, // Acknowledging previous sequence
-			Flags:        0, // No flags needed - ackThrough always valid per spec
+			Flags:        0,   // No flags needed - ackThrough always valid per spec
 		}
 
 		data, err := pkt.Marshal()

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	go_i2cp "github.com/go-i2p/go-i2cp"
-	"github.com/rs/zerolog/log"
 )
 
 // StreamManager manages I2CP session integration and routes incoming packets

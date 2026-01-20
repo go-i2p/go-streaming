@@ -31,18 +31,9 @@ import (
 	"time"
 
 	go_i2cp "github.com/go-i2p/go-i2cp"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func init() {
-	// Configure logging for system tests
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	zerolog.SetGlobalLevel(zerolog.DebugLevel)
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
-}
 
 // getRouterAddress returns I2P router address from environment or default.
 func getRouterAddress() string {

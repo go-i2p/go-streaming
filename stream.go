@@ -24,7 +24,6 @@ import (
 
 	"github.com/armon/circbuf"
 	go_i2cp "github.com/go-i2p/go-i2cp"
-	"github.com/rs/zerolog/log"
 )
 
 // ConnState represents the current state of a streaming connection.
@@ -434,8 +433,8 @@ func generateConnectionIdentifiers() (uint32, uint32, error) {
 // Sets up all fields, buffers, channels, and condition variables.
 func initializeStreamConn(session *go_i2cp.Session, manager *StreamManager, dest *go_i2cp.Destination,
 	localPort, remotePort uint16, mtu int, isn, localStreamID uint32, recvBuf *circbuf.Buffer,
-	ctx context.Context, cancel context.CancelFunc) *StreamConn {
-
+	ctx context.Context, cancel context.CancelFunc,
+) *StreamConn {
 	conn := &StreamConn{
 		manager:           manager,
 		session:           session,

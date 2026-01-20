@@ -314,7 +314,7 @@ func (p *Packet) marshalOfflineSignature(buf []byte) ([]byte, error) {
 
 // calculateOptionSizes computes all size components needed for marshaling optional fields.
 // It returns the from destination bytes, signature length, offline signature size, and total option size.
-func (p *Packet) calculateOptionSizes() (fromBytes []byte, sigLen int, offlineSigSize int, optionSize uint16, err error) {
+func (p *Packet) calculateOptionSizes() (fromBytes []byte, sigLen, offlineSigSize int, optionSize uint16, err error) {
 	fromBytes, err = p.calculateFromDestinationSize()
 	if err != nil {
 		return nil, 0, 0, 0, err
@@ -598,7 +598,7 @@ func (p *Packet) unmarshalDestSignature(data []byte, offset, optionsEnd int, off
 // unmarshalHeader parses the packet header including NACKs, ResendDelay, flags, and option size.
 // Per spec order: required fields | NACKCount | NACKs | ResendDelay | Flags | OptionSize
 // It returns the offset after the header and the options end position.
-func (p *Packet) unmarshalHeader(data []byte) (offset int, optionsEnd int, err error) {
+func (p *Packet) unmarshalHeader(data []byte) (offset, optionsEnd int, err error) {
 	offset = p.unmarshalRequiredFields(data)
 
 	offset, err = p.unmarshalNACKs(data, offset)

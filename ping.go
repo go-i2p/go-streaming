@@ -9,7 +9,6 @@ import (
 	"time"
 
 	go_i2cp "github.com/go-i2p/go-i2cp"
-	"github.com/rs/zerolog/log"
 )
 
 // MaxPingPayloadSize is the maximum payload size for ping/pong packets.
