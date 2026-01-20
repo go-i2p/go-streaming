@@ -320,6 +320,10 @@ const (
 	// Per I2P streaming spec: "Two NACKs of a packet is a request for a 'fast retransmit'"
 	FastRetransmitThreshold = 2
 
+	// MaxRetransmissions is the maximum number of times a packet can be retransmitted.
+	// After this many retries, the packet is considered undeliverable.
+	MaxRetransmissions = 10
+
 	// PersistProbeInterval is the interval between probe packets when choked.
 	// Per I2P streaming spec: "The choked endpoint should start a 'persist timer'
 	// to control the probing" to compensate for possible lost unchoke packets.
@@ -3073,7 +3077,9 @@ func (s *StreamConn) sendPacketLocked(pkt *Packet) error {
 
 	s.trackPacketForRetransmission(pkt, data)
 
-	if err := s.sendViaI2CP(data); err != nil {
+	// Use message tracking if manager has a tracker
+	isDataPkt := len(pkt.Payload) > 0
+	if err := s.sendViaI2CPWithTracking(data, pkt.SequenceNum, isDataPkt); err != nil {
 		return err
 	}
 
@@ -3103,12 +3109,34 @@ func (s *StreamConn) trackPacketForRetransmission(pkt *Packet, data []byte) {
 }
 
 // sendViaI2CP sends marshaled packet data via the I2CP session.
+// This is the legacy version that doesn't use message tracking.
 func (s *StreamConn) sendViaI2CP(data []byte) error {
 	if s.session == nil {
 		return fmt.Errorf("cannot send packet: no I2CP session")
 	}
 	stream := go_i2cp.NewStream(data)
 	if err := s.session.SendMessage(s.dest, 6, s.localPort, s.remotePort, stream, 0); err != nil {
+		return fmt.Errorf("send message: %w", err)
+	}
+	return nil
+}
+
+// sendViaI2CPWithTracking sends marshaled packet data via the I2CP session
+// with message status tracking for delivery confirmation.
+func (s *StreamConn) sendViaI2CPWithTracking(data []byte, seqNum uint32, isDataPkt bool) error {
+	if s.session == nil {
+		return fmt.Errorf("cannot send packet: no I2CP session")
+	}
+
+	stream := go_i2cp.NewStream(data)
+
+	// Use message tracking if available
+	var nonce uint32
+	if s.manager != nil && s.manager.msgTracker != nil {
+		nonce = s.manager.msgTracker.TrackMessage(s, seqNum, len(data), isDataPkt)
+	}
+
+	if err := s.session.SendMessage(s.dest, 6, s.localPort, s.remotePort, stream, nonce); err != nil {
 		return fmt.Errorf("send message: %w", err)
 	}
 	return nil
@@ -3230,6 +3258,72 @@ func (s *StreamConn) sendCloseLocked() error {
 	}
 
 	return s.sendPacketLocked(pkt)
+}
+
+// handleMessageDelivered is called when a message is successfully delivered.
+// This is invoked by the message status tracker when receiving success status.
+func (s *StreamConn) handleMessageDelivered(seqNum uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Remove from sent packets - it's been acknowledged by the network
+	if s.sentPackets != nil {
+		if _, exists := s.sentPackets[seqNum]; exists {
+			delete(s.sentPackets, seqNum)
+			log.Debug().
+				Uint32("seq", seqNum).
+				Msg("message confirmed delivered by I2CP")
+		}
+	}
+
+	// Could also be used to update RTT estimates based on I2CP delivery time
+	// but we already have streaming-level RTT tracking via ACKs
+}
+
+// handleMessageFailed is called when a message delivery fails.
+// This is invoked by the message status tracker when receiving failure status.
+// If retriable is true, the packet should be retransmitted.
+func (s *StreamConn) handleMessageFailed(seqNum uint32, retriable bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return
+	}
+
+	log.Warn().
+		Uint32("seq", seqNum).
+		Bool("retriable", retriable).
+		Msg("message delivery failed at I2CP layer")
+
+	if !retriable {
+		// Non-retriable failure - connection may be broken
+		// Mark packet as failed but don't retry (will be handled by timeout)
+		return
+	}
+
+	// Retransmit the failed packet if we still have it
+	if s.sentPackets != nil {
+		if pktInfo, exists := s.sentPackets[seqNum]; exists {
+			pktInfo.retryCount++
+			if pktInfo.retryCount <= MaxRetransmissions {
+				log.Info().
+					Uint32("seq", seqNum).
+					Int("retryCount", pktInfo.retryCount).
+					Msg("retransmitting packet after I2CP failure")
+
+				// Re-send the stored packet data
+				if err := s.sendViaI2CP(pktInfo.data); err != nil {
+					log.Warn().Err(err).Uint32("seq", seqNum).Msg("retransmission failed")
+				}
+			} else {
+				log.Warn().
+					Uint32("seq", seqNum).
+					Int("retryCount", pktInfo.retryCount).
+					Msg("max retransmissions exceeded for I2CP failure")
+			}
+		}
+	}
 }
 
 // LocalAddr returns the local network address.

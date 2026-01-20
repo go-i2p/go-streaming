@@ -44,6 +44,9 @@ type StreamManager struct {
 	// Access list filtering
 	accessFilter *accessFilter
 
+	// Message status tracking for reliable delivery
+	msgTracker *messageStatusTracker
+
 	// Packet processing
 	incomingPackets chan *incomingPacket
 	processorCtx    context.Context
@@ -117,6 +120,9 @@ func NewStreamManager(client *go_i2cp.Client) (*StreamManager, error) {
 
 	// Initialize access filter with default config (disabled)
 	sm.accessFilter = newAccessFilter(DefaultAccessListConfig())
+
+	// Initialize message status tracker for delivery confirmation
+	sm.msgTracker = newMessageStatusTracker(sm)
 
 	// Create I2CP session with callbacks
 	callbacks := go_i2cp.SessionCallbacks{
@@ -397,25 +403,41 @@ func (sm *StreamManager) handleDestinationResult(
 // This is registered as OnMessageStatus callback in SessionCallbacks.
 //
 // Used for reliability tracking and retransmission logic.
+// Now fully implemented using go-i2cp's exported status constants.
 func (sm *StreamManager) handleMessageStatus(
 	session *go_i2cp.Session,
 	messageId uint32,
 	status go_i2cp.SessionMessageStatus,
 	size, nonce uint32,
 ) {
-	// For MVP, just log the status
-	// Full status handling will be implemented when go-i2cp exports the constants
+	// Get the status category for logging
+	category := go_i2cp.GetMessageStatusCategory(status)
+
 	log.Trace().
 		Uint32("messageId", messageId).
 		Uint8("status", uint8(status)).
+		Str("category", category).
 		Uint32("size", size).
 		Msg("message status update")
 
-	// TODO: Implement full status handling when constants are available:
-	// - GUARANTEED_SUCCESS -> mark delivered
-	// - GUARANTEED_FAILURE -> retry
-	// - SEND_ACCEPTED -> track in-flight
-	// - etc.
+	// Delegate to the message status tracker for proper handling
+	if sm.msgTracker != nil {
+		sm.msgTracker.HandleStatus(messageId, status, size, nonce)
+	}
+}
+
+// GetMessageStats returns the current message delivery statistics.
+func (sm *StreamManager) GetMessageStats() MessageStats {
+	if sm.msgTracker == nil {
+		return MessageStats{}
+	}
+	return sm.msgTracker.GetStats()
+}
+
+// MessageTracker returns the message status tracker for this manager.
+// This is used internally by connections to track outgoing messages.
+func (sm *StreamManager) MessageTracker() *messageStatusTracker {
+	return sm.msgTracker
 }
 
 // processPackets runs in a goroutine to dispatch incoming packets.
