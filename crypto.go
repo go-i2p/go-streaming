@@ -293,33 +293,47 @@ func VerifyOfflineSignature(offsig *OfflineSig, dest *go_i2cp.Destination, crypt
 // findSignatureOffset calculates the byte offset where the signature field
 // begins in a marshaled packet.
 //
-// The signature is always the last optional field, appearing after:
-//   - Fixed header (22 bytes)
-//   - NACKs (if present)
-//   - ResendDelay (if FlagDelayRequested)
-//   - MaxPacketSize (if FlagMaxPacketSizeIncluded)
-//   - FROM destination (if FlagFromIncluded)
-//   - Signature comes last
+// Packet header layout (all integers big-endian):
 //
-// This does NOT include the payload, as the signature is in the options section.
+//	Offset 0-3:   SendStreamID (4 bytes)
+//	Offset 4-7:   RecvStreamID (4 bytes)
+//	Offset 8-11:  SequenceNum (4 bytes)
+//	Offset 12-15: AckThrough (4 bytes)
+//	Offset 16:    NACKCount (1 byte) = N
+//	Offset 17:    NACKs (N × 4 bytes, variable)
+//	After NACKs:  ResendDelay (1 byte)
+//	After that:   Flags (2 bytes)
+//	After that:   OptionSize (2 bytes)
+//	After that:   OptionData (variable, includes signature as last field)
+//
+// Base header size (with 0 NACKs) = 16 + 1 + 0 + 1 + 2 + 2 = 22 bytes
+// With N NACKs: 22 + (N × 4) bytes to reach option data
+//
+// Within option data, fields appear in this order (per spec):
+//  1. OptionalDelay (2 bytes, if FlagDelayRequested)
+//  2. FROM destination (387+ bytes, if FlagFromIncluded)
+//  3. MaxPacketSize (2 bytes, if FlagMaxPacketSizeIncluded)
+//  4. OfflineSignature (variable, if FlagOfflineSignature)
+//  5. Signature (last field, if FlagSignatureIncluded)
+//
+// The signature is always the last field in option data.
 func findSignatureOffset(pkt *Packet) int {
-	// Start after fixed header (22 bytes)
+	// Base offset: 22 bytes for minimum header (0 NACKs case)
+	// This includes: SendStreamID(4) + RecvStreamID(4) + SequenceNum(4) +
+	// AckThrough(4) + NACKCount(1) + ResendDelay(1) + Flags(2) + OptionSize(2)
 	offset := 22
 
-	// Add NACK bytes
+	// Add space for NACKs (each NACK is 4 bytes)
+	// NACKs appear between NACKCount and ResendDelay in the wire format
 	offset += len(pkt.NACKs) * 4
 
-	// Add optional delay (2 bytes if FlagDelayRequested set)
+	// Option data fields in spec order (must match packet.go marshaling):
+	// 1. OptionalDelay (2 bytes if FlagDelayRequested)
 	if pkt.Flags&FlagDelayRequested != 0 {
 		offset += 2
 	}
 
-	// Add MaxPacketSize (2 bytes if FlagMaxPacketSizeIncluded set)
-	if pkt.Flags&FlagMaxPacketSizeIncluded != 0 {
-		offset += 2
-	}
-
-	// Add FROM destination (387+ bytes if FlagFromIncluded set)
+	// 2. FROM destination (387+ bytes if FlagFromIncluded)
 	if pkt.Flags&FlagFromIncluded != 0 && pkt.FromDestination != nil {
 		// Calculate destination size by marshaling it
 		stream := go_i2cp.NewStream(make([]byte, 0, 512))
@@ -332,6 +346,19 @@ func findSignatureOffset(pkt *Packet) int {
 		}
 	}
 
-	// Signature offset is now at the current position
+	// 3. MaxPacketSize (2 bytes if FlagMaxPacketSizeIncluded)
+	if pkt.Flags&FlagMaxPacketSizeIncluded != 0 {
+		offset += 2
+	}
+
+	// 4. OfflineSignature (variable if FlagOfflineSignature)
+	// Format: Expires(4) + TransientSigType(2) + TransientPublicKey(variable) + DestSignature(variable)
+	if pkt.Flags&FlagOfflineSignature != 0 && pkt.OfflineSignature != nil {
+		transientKeyLen := getPublicKeyLength(pkt.OfflineSignature.TransientSigType)
+		destSigLen := getSignatureLength(pkt.FromDestination)
+		offset += 4 + 2 + transientKeyLen + destSigLen
+	}
+
+	// 5. Signature is at current offset (last field)
 	return offset
 }

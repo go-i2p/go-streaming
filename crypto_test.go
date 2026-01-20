@@ -173,8 +173,48 @@ func TestFindSignatureOffset(t *testing.T) {
 		}
 
 		offset := findSignatureOffset(pkt)
-		// Header (22) + NACKs (8) + Delay (2) + MaxPacketSize (2) + FROM (387+) = 421+
+		// Header (22) + NACKs (8) + Delay (2) + FROM (387+) + MaxPacketSize (2) = 421+
+		// Note: Order is DELAY -> FROM -> MAX_PACKET_SIZE per I2P streaming spec
 		assert.GreaterOrEqual(t, offset, 421, "offset should include all optional fields")
+	})
+
+	t.Run("verify option data order matches marshaling", func(t *testing.T) {
+		// This test verifies findSignatureOffset uses the correct order:
+		// DELAY -> FROM -> MAX_PACKET_SIZE -> OFFLINE_SIG -> SIGNATURE
+		// per I2P streaming spec and matching packet.go marshalPacketBody()
+		dest, err := go_i2cp.NewDestination(crypto)
+		require.NoError(t, err)
+
+		keyPair, err := dest.SigningKeyPair()
+		require.NoError(t, err)
+
+		pkt := &Packet{
+			SendStreamID:    1,
+			RecvStreamID:    2,
+			SequenceNum:     100,
+			AckThrough:      99,
+			Flags:           FlagDelayRequested | FlagMaxPacketSizeIncluded | FlagFromIncluded | FlagSignatureIncluded,
+			OptionalDelay:   5000,
+			MaxPacketSize:   1730,
+			FromDestination: dest,
+		}
+
+		// Sign the packet
+		err = SignPacket(pkt, keyPair)
+		require.NoError(t, err)
+
+		// Marshal and verify
+		data, err := pkt.Marshal()
+		require.NoError(t, err)
+
+		// The signature should be at the calculated offset
+		offset := findSignatureOffset(pkt)
+		sigLen := 64 // Ed25519 signature length
+		require.LessOrEqual(t, offset+sigLen, len(data), "signature must fit in marshaled data")
+
+		// Extract signature from marshaled data at calculated offset
+		sigFromData := data[offset : offset+sigLen]
+		assert.Equal(t, pkt.Signature, sigFromData, "signature at calculated offset must match packet signature")
 	})
 }
 
