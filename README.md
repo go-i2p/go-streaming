@@ -159,6 +159,70 @@ func main() {
 
 See [examples/](examples/) directory for complete working examples.
 
+## Logging
+
+This library uses structured logging via [`github.com/go-i2p/logger`](https://github.com/go-i2p/logger). Logging is controlled through environment variables and is disabled by default for production use.
+
+### Environment Variables
+
+| Variable | Values | Description |
+|----------|--------|-------------|
+| `DEBUG_I2P` | `debug`, `warn`, `error` | Log level (default: disabled) |
+| `WARNFAIL_I2P` | `true` | Fast-fail mode - exit on warnings |
+
+### Usage Examples
+
+```bash
+# Normal operation (logging disabled)
+go run ./examples/echo/server/
+
+# Debug logging enabled
+DEBUG_I2P=debug go run ./examples/echo/server/
+
+# Warn-level with fast-fail
+WARNFAIL_I2P=true DEBUG_I2P=warn go run ./examples/echo/server/
+
+# Test with debug output
+DEBUG_I2P=debug go test -v ./...
+```
+
+### Log Output Examples
+
+**Connection establishment:**
+```
+DEBUG starting connection sendStreamID=0x12345678 remotePort=8080
+DEBUG sending SYN packet seq=1 mtu=1730
+DEBUG received SYN-ACK remoteStreamID=0xabcdef01 remoteMTU=1730
+DEBUG connection established state=ESTABLISHED
+```
+
+**Packet processing (trace level):**
+```
+TRACE marshaling packet sendStreamID=0x12345678 seq=42 flags=0x0001 payloadLen=1500
+TRACE packet marshaled totalBytes=1522
+```
+
+**Error handling:**
+```
+WARN signature verification failed error="invalid signature"
+ERROR connection reset by peer streamID=0x12345678
+```
+
+**TCB cache operations:**
+```
+DEBUG TCB cache hit - applying cached connection parameters dest=a1b2c3d4 rtt=250ms window=12
+DEBUG TCB cache update - stored connection parameters dest=a1b2c3d4 rtt=280ms updated=true
+```
+
+### Log Levels
+
+| Level | Purpose |
+|-------|---------|
+| `trace` | Very detailed internal operations (packet marshal/unmarshal, signature operations) |
+| `debug` | Connection state changes, cache operations, normal flow |
+| `warn` | Recoverable issues (signature failures, rate limits exceeded) |
+| `error` | Serious failures (connection resets, unrecoverable errors) |
+
 ## Testing
 
 Run the full test suite:

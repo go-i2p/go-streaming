@@ -134,12 +134,12 @@ func (c *tcbCache) Get(dest *go_i2cp.Destination) (time.Duration, time.Duration,
 		dampedWindow = 1
 	}
 
-	log.Debug().
-		Str("dest", key[:8]).
-		Dur("rtt", dampedRTT).
-		Dur("rttvar", dampedRTTVar).
-		Uint32("window", dampedWindow).
-		Msg("TCB cache hit - applying cached connection parameters")
+	log.WithFields(map[string]interface{}{
+		"dest":   key[:8],
+		"rtt":    dampedRTT,
+		"rttvar": dampedRTTVar,
+		"window": dampedWindow,
+	}).Debug("TCB cache hit - applying cached connection parameters")
 
 	return dampedRTT, dampedRTTVar, dampedWindow, true
 }
@@ -185,13 +185,13 @@ func (c *tcbCache) Put(dest *go_i2cp.Destination, rtt, rttVariance time.Duration
 		}
 	}
 
-	log.Debug().
-		Str("dest", key[:8]).
-		Dur("rtt", rtt).
-		Dur("rttvar", rttVariance).
-		Uint32("window", windowSize).
-		Bool("updated", exists).
-		Msg("TCB cache update - stored connection parameters")
+	log.WithFields(map[string]interface{}{
+		"dest":    key[:8],
+		"rtt":     rtt,
+		"rttvar":  rttVariance,
+		"window":  windowSize,
+		"updated": exists,
+	}).Debug("TCB cache update - stored connection parameters")
 }
 
 // Size returns the number of entries in the cache.
@@ -205,6 +205,7 @@ func (c *tcbCache) Size() int {
 func (c *tcbCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	log.WithField("entriesCleared", len(c.entries)).Debug("clearing TCB cache")
 	c.entries = make(map[string]*tcbEntry)
 }
 
@@ -224,10 +225,10 @@ func (c *tcbCache) CleanupExpired() int {
 	}
 
 	if removed > 0 {
-		log.Debug().
-			Int("removed", removed).
-			Int("remaining", len(c.entries)).
-			Msg("TCB cache cleanup - removed expired entries")
+		log.WithFields(map[string]interface{}{
+			"removed":   removed,
+			"remaining": len(c.entries),
+		}).Debug("TCB cache cleanup - removed expired entries")
 	}
 
 	return removed
@@ -292,14 +293,14 @@ func applyTCBDataToConnection(conn *StreamConn, data TCBData) {
 		conn.rto = calculateRTOFromValues(conn.srtt, conn.rttVariance)
 	}
 
-	log.Debug().
-		Uint32("localStreamID", conn.localStreamID).
-		Dur("rtt", conn.srtt).
-		Dur("rttvar", conn.rttVariance).
-		Uint32("cwnd", conn.cwnd).
-		Uint32("ssthresh", conn.ssthresh).
-		Dur("rto", conn.rto).
-		Msg("Applied TCB cache data to new connection")
+	log.WithFields(map[string]interface{}{
+		"localStreamID": conn.localStreamID,
+		"rtt":           conn.srtt,
+		"rttvar":        conn.rttVariance,
+		"cwnd":          conn.cwnd,
+		"ssthresh":      conn.ssthresh,
+		"rto":           conn.rto,
+	}).Debug("Applied TCB cache data to new connection")
 }
 
 // calculateRTOFromValues computes RTO from RTT values per RFC 6298.

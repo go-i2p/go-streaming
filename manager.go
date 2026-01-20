@@ -167,28 +167,28 @@ func NewStreamManager(client *go_i2cp.Client) (*StreamManager, error) {
 // Note: Some I2P router configurations may not send SessionCreated responses.
 // In this case, we proceed after a timeout as the session may still be usable.
 func (sm *StreamManager) StartSession(ctx context.Context) error {
-	log.Info().Msg("creating I2CP session")
-	log.Debug().Msg("sending CreateSession message to I2P router")
+	log.Info("creating I2CP session")
+	log.Debug("sending CreateSession message to I2P router")
 
 	if err := sm.client.CreateSession(ctx, sm.session); err != nil {
-		log.Error().Err(err).Msg("CreateSession failed")
+		log.WithError(err).Error("CreateSession failed")
 		return fmt.Errorf("create session: %w", err)
 	}
 
-	log.Debug().Msg("CreateSession message sent, waiting for SessionCreated response")
-	log.Debug().Msg("waiting for OnStatus callback with SESSION_STATUS_CREATED")
+	log.Debug("CreateSession message sent, waiting for SessionCreated response")
+	log.Debug("waiting for OnStatus callback with SESSION_STATUS_CREATED")
 
 	// Wait for session to be ready (signaled by OnStatus callback)
 	// Some routers may not send SessionCreated - proceed after timeout
 	select {
 	case <-sm.sessionReady:
-		log.Info().Msg("I2CP session ready")
-		log.Debug().Msg("OnStatus callback received SESSION_STATUS_CREATED")
+		log.Info("I2CP session ready")
+		log.Debug("OnStatus callback received SESSION_STATUS_CREATED")
 		return nil
 	case <-ctx.Done():
 		// Timeout is expected with some router configurations
-		log.Warn().Msg("session creation timeout - router may not send SessionCreated response")
-		log.Info().Msg("proceeding anyway (router-specific behavior)")
+		log.Warn("session creation timeout - router may not send SessionCreated response")
+		log.Info("proceeding anyway (router-specific behavior)")
 
 		// Give router a moment to complete session setup
 		time.Sleep(1 * time.Second)
@@ -214,17 +214,13 @@ func (sm *StreamManager) Destination() *go_i2cp.Destination {
 // When SYN packets arrive for this port, they'll be routed to the listener.
 func (sm *StreamManager) RegisterListener(port uint16, listener *StreamListener) {
 	sm.listeners.Store(port, listener)
-	log.Debug().
-		Uint16("port", port).
-		Msg("registered listener")
+	log.WithField("port", port).Debug("registered listener")
 }
 
 // UnregisterListener removes a listener registration.
 func (sm *StreamManager) UnregisterListener(port uint16) {
 	sm.listeners.Delete(port)
-	log.Debug().
-		Uint16("port", port).
-		Msg("unregistered listener")
+	log.WithField("port", port).Debug("unregistered listener")
 }
 
 // LookupDestination performs a destination lookup and waits for the result.
@@ -261,20 +257,20 @@ func (sm *StreamManager) LookupDestination(ctx context.Context, hostname string)
 func (sm *StreamManager) RegisterConnection(localPort, remotePort uint16, conn *StreamConn) {
 	key := connKey{localPort: localPort, remotePort: remotePort}
 	sm.connections.Store(key, conn)
-	log.Debug().
-		Uint16("localPort", localPort).
-		Uint16("remotePort", remotePort).
-		Msg("registered connection")
+	log.WithFields(map[string]interface{}{
+		"localPort":  localPort,
+		"remotePort": remotePort,
+	}).Debug("registered connection")
 }
 
 // UnregisterConnection removes a connection registration.
 func (sm *StreamManager) UnregisterConnection(localPort, remotePort uint16) {
 	key := connKey{localPort: localPort, remotePort: remotePort}
 	sm.connections.Delete(key)
-	log.Debug().
-		Uint16("localPort", localPort).
-		Uint16("remotePort", remotePort).
-		Msg("unregistered connection")
+	log.WithFields(map[string]interface{}{
+		"localPort":  localPort,
+		"remotePort": remotePort,
+	}).Debug("unregistered connection")
 }
 
 // handleIncomingMessage is called by I2CP when messages arrive.
@@ -294,26 +290,24 @@ func (sm *StreamManager) handleIncomingMessage(
 	srcPort, destPort uint16,
 	payload *go_i2cp.Stream,
 ) {
-	log.Trace().
-		Uint8("protocol", protocol).
-		Uint16("srcPort", srcPort).
-		Uint16("destPort", destPort).
-		Int("payloadSize", payload.Len()).
-		Msg("handleIncomingMessage callback invoked")
+	log.WithFields(map[string]interface{}{
+		"protocol":    protocol,
+		"srcPort":     srcPort,
+		"destPort":    destPort,
+		"payloadSize": payload.Len(),
+	}).Debug("handleIncomingMessage callback invoked")
 
 	// Only process I2P streaming protocol (6)
 	if protocol != 6 {
-		log.Trace().
-			Uint8("protocol", protocol).
-			Msg("ignoring non-streaming protocol")
+		log.WithField("protocol", protocol).Debug("ignoring non-streaming protocol")
 		return
 	}
 
-	log.Debug().
-		Uint16("srcPort", srcPort).
-		Uint16("destPort", destPort).
-		Int("payloadLen", len(payload.Bytes())).
-		Msg("received streaming message")
+	log.WithFields(map[string]interface{}{
+		"srcPort":    srcPort,
+		"destPort":   destPort,
+		"payloadLen": len(payload.Bytes()),
+	}).Debug("received streaming message")
 
 	// Queue for processing by packet dispatcher
 	packet := &incomingPacket{
@@ -328,9 +322,7 @@ func (sm *StreamManager) handleIncomingMessage(
 	case sm.incomingPackets <- packet:
 		// Queued successfully
 	default:
-		log.Warn().
-			Uint16("destPort", destPort).
-			Msg("incoming packet queue full, dropping packet")
+		log.WithField("destPort", destPort).Warn("incoming packet queue full, dropping packet")
 	}
 }
 
@@ -340,44 +332,40 @@ func (sm *StreamManager) handleSessionStatus(
 	session *go_i2cp.Session,
 	status go_i2cp.SessionStatus,
 ) {
-	log.Debug().
-		Int("status", int(status)).
-		Msg("I2CP session status callback received")
+	log.WithField("status", int(status)).Debug("I2CP session status callback received")
 
 	switch status {
 	case go_i2cp.I2CP_SESSION_STATUS_CREATED:
-		log.Info().Msg("I2CP session created - streaming ready")
-		log.Debug().Uint16("sessionId", session.ID()).Msg("session ID assigned")
+		log.Info("I2CP session created - streaming ready")
+		log.WithField("sessionId", session.ID()).Debug("session ID assigned")
 
 		// Signal session is ready
 		select {
 		case sm.sessionReady <- struct{}{}:
-			log.Debug().Msg("sessionReady signal sent successfully")
+			log.Debug("sessionReady signal sent successfully")
 		default:
-			log.Debug().Msg("sessionReady signal already sent (channel full)")
+			log.Debug("sessionReady signal already sent (channel full)")
 		}
 
 	case go_i2cp.I2CP_SESSION_STATUS_DESTROYED:
-		log.Info().Msg("I2CP session destroyed")
+		log.Info("I2CP session destroyed")
 		sm.closeAllConnections()
 
 	case go_i2cp.I2CP_SESSION_STATUS_REFUSED:
-		log.Warn().Msg("I2CP session refused by router")
-		log.Debug().Msg("possible causes:")
-		log.Debug().Msg("  1. Router rejecting session requests")
-		log.Debug().Msg("  2. Authentication required")
-		log.Debug().Msg("  3. Resource limits exceeded")
+		log.Warn("I2CP session refused by router")
+		log.Debug("possible causes:")
+		log.Debug("  1. Router rejecting session requests")
+		log.Debug("  2. Authentication required")
+		log.Debug("  3. Resource limits exceeded")
 
 	case go_i2cp.I2CP_SESSION_STATUS_INVALID:
-		log.Warn().Msg("I2CP session invalid")
+		log.Warn("I2CP session invalid")
 
 	case go_i2cp.I2CP_SESSION_STATUS_UPDATED:
-		log.Debug().Msg("I2CP session updated")
+		log.Debug("I2CP session updated")
 
 	default:
-		log.Warn().
-			Int("status", int(status)).
-			Msg("unknown session status received")
+		log.WithField("status", int(status)).Warn("unknown session status received")
 	}
 }
 
@@ -392,15 +380,15 @@ func (sm *StreamManager) handleDestinationResult(
 	dest *go_i2cp.Destination,
 ) {
 	if dest != nil {
-		log.Debug().
-			Uint32("requestId", requestId).
-			Str("address", address).
-			Msg("destination lookup success")
+		log.WithFields(map[string]interface{}{
+			"requestId": requestId,
+			"address":   address,
+		}).Debug("destination lookup success")
 	} else {
-		log.Warn().
-			Uint32("requestId", requestId).
-			Str("address", address).
-			Msg("destination lookup failed")
+		log.WithFields(map[string]interface{}{
+			"requestId": requestId,
+			"address":   address,
+		}).Warn("destination lookup failed")
 	}
 
 	// Store the lookup result
@@ -426,12 +414,12 @@ func (sm *StreamManager) handleMessageStatus(
 	// Get the status category for logging
 	category := go_i2cp.GetMessageStatusCategory(status)
 
-	log.Trace().
-		Uint32("messageId", messageId).
-		Uint8("status", uint8(status)).
-		Str("category", category).
-		Uint32("size", size).
-		Msg("message status update")
+	log.WithFields(map[string]interface{}{
+		"messageId": messageId,
+		"status":    uint8(status),
+		"category":  category,
+		"size":      size,
+	}).Debug("message status update")
 
 	// Delegate to the message status tracker for proper handling
 	if sm.msgTracker != nil {
@@ -476,8 +464,8 @@ func (sm *StreamManager) SetStreamProfile(profile StreamProfile) {
 func (sm *StreamManager) processPackets() {
 	defer sm.processorWg.Done()
 
-	log.Debug().Msg("packet processor started")
-	defer log.Debug().Msg("packet processor stopped")
+	log.Debug("packet processor started")
+	defer log.Debug("packet processor stopped")
 
 	for {
 		select {
@@ -524,7 +512,7 @@ func (sm *StreamManager) dispatchPacket(incoming *incomingPacket) {
 func (sm *StreamManager) unmarshalIncomingPacket(incoming *incomingPacket) (*Packet, error) {
 	pkt := &Packet{}
 	if err := pkt.Unmarshal(incoming.payload); err != nil {
-		log.Warn().Err(err).Uint16("destPort", incoming.destPort).Msg("failed to unmarshal streaming packet")
+		log.WithError(err).WithField("destPort", incoming.destPort).Warn("failed to unmarshal streaming packet")
 		return nil, err
 	}
 	return pkt, nil
@@ -532,10 +520,14 @@ func (sm *StreamManager) unmarshalIncomingPacket(incoming *incomingPacket) (*Pac
 
 // logDispatchingPacket logs debug information about a dispatched packet.
 func (sm *StreamManager) logDispatchingPacket(pkt *Packet, incoming *incomingPacket) {
-	log.Debug().
-		Uint32("seq", pkt.SequenceNum).Uint32("ack", pkt.AckThrough).Uint16("flags", pkt.Flags).
-		Uint16("srcPort", incoming.srcPort).Uint16("destPort", incoming.destPort).
-		Int("payload", len(pkt.Payload)).Msg("dispatching packet")
+	log.WithFields(map[string]interface{}{
+		"seq":      pkt.SequenceNum,
+		"ack":      pkt.AckThrough,
+		"flags":    pkt.Flags,
+		"srcPort":  incoming.srcPort,
+		"destPort": incoming.destPort,
+		"payload":  len(pkt.Payload),
+	}).Debug("dispatching packet")
 }
 
 // isSynPacket checks if the packet is a SYN packet for a new connection.
@@ -552,22 +544,22 @@ func (sm *StreamManager) isSynPacket(pkt *Packet) bool {
 //   - Pong: ECHO flag set, sendStreamId == 0 (resolve pending ping)
 func (sm *StreamManager) handleEchoPacket(pkt *Packet, incoming *incomingPacket) {
 	if isPingPacket(pkt) {
-		log.Debug().
-			Uint32("streamID", pkt.SendStreamID).
-			Int("payloadLen", len(pkt.Payload)).
-			Msg("received ping")
+		log.WithFields(map[string]interface{}{
+			"streamID":   pkt.SendStreamID,
+			"payloadLen": len(pkt.Payload),
+		}).Debug("received ping")
 		sm.pingMgr.handlePing(pkt, incoming.srcDest, incoming.srcPort, incoming.destPort)
 	} else if isPongPacket(pkt) {
-		log.Debug().
-			Uint32("streamID", pkt.RecvStreamID).
-			Int("payloadLen", len(pkt.Payload)).
-			Msg("received pong")
+		log.WithFields(map[string]interface{}{
+			"streamID":   pkt.RecvStreamID,
+			"payloadLen": len(pkt.Payload),
+		}).Debug("received pong")
 		sm.pingMgr.handlePong(pkt)
 	} else {
-		log.Debug().
-			Uint16("flags", pkt.Flags).
-			Uint32("sendStreamID", pkt.SendStreamID).
-			Msg("received ECHO packet with unexpected format")
+		log.WithFields(map[string]interface{}{
+			"flags":        pkt.Flags,
+			"sendStreamID": pkt.SendStreamID,
+		}).Debug("received ECHO packet with unexpected format")
 	}
 }
 
@@ -583,9 +575,9 @@ func (sm *StreamManager) handleEchoPacket(pkt *Packet, incoming *incomingPacket)
 //
 //	result := manager.Ping(ctx, destination, []byte("hello"))
 //	if result.Err != nil {
-//	    log.Error().Err(result.Err).Msg("ping failed")
+//	    log.WithError(result.Err).Error("ping failed")
 //	} else {
-//	    log.Info().Dur("rtt", result.RTT).Msg("ping successful")
+//	    log.WithField("rtt", result.RTT).Info("ping successful")
 //	}
 func (sm *StreamManager) Ping(ctx context.Context, dest *go_i2cp.Destination, payload []byte) *PingResult {
 	return sm.pingMgr.Ping(ctx, dest, payload)
@@ -698,7 +690,7 @@ func (sm *StreamManager) handleSynPacket(pkt *Packet, incoming *incomingPacket) 
 		listener.handleIncomingSYN(pkt, incoming.srcPort, incoming.srcDest)
 		return
 	}
-	log.Debug().Uint16("destPort", incoming.destPort).Msg("SYN packet for port with no listener - sending RESET")
+	log.WithField("destPort", incoming.destPort).Debug("SYN packet for port with no listener - sending RESET")
 	sm.sendResetPacket(incoming.srcDest, pkt.SendStreamID, incoming.destPort, incoming.srcPort)
 }
 
@@ -710,14 +702,17 @@ func (sm *StreamManager) routeToConnection(pkt *Packet, incoming *incomingPacket
 		conn.handleIncomingPacket(pkt)
 		return
 	}
-	log.Debug().Uint16("localPort", incoming.destPort).Uint16("remotePort", incoming.srcPort).Msg("packet for unknown connection - sending RESET")
+	log.WithFields(map[string]interface{}{
+		"localPort":  incoming.destPort,
+		"remotePort": incoming.srcPort,
+	}).Debug("packet for unknown connection - sending RESET")
 	sm.sendResetPacket(incoming.srcDest, pkt.SendStreamID, incoming.destPort, incoming.srcPort)
 }
 
 // closeAllConnections closes all registered connections.
 // Called when session is destroyed or manager is closed.
 func (sm *StreamManager) closeAllConnections() {
-	log.Info().Msg("closing all streaming connections")
+	log.Info("closing all streaming connections")
 
 	// Close all listeners
 	sm.listeners.Range(func(key, value interface{}) bool {
@@ -740,11 +735,11 @@ func (sm *StreamManager) closeAllConnections() {
 // This indicates that our inbound tunnels are ready and the router has
 // published our destination to the network, allowing other peers to reach us.
 func (sm *StreamManager) handleLeaseSet2(session *go_i2cp.Session, leaseSet *go_i2cp.LeaseSet2) {
-	log.Info().
-		Uint8("type", leaseSet.Type()).
-		Int("leases", leaseSet.LeaseCount()).
-		Time("expires", leaseSet.Expires()).
-		Msg("LeaseSet published")
+	log.WithFields(map[string]interface{}{
+		"type":    leaseSet.Type(),
+		"leases":  leaseSet.LeaseCount(),
+		"expires": leaseSet.Expires(),
+	}).Info("LeaseSet published")
 
 	// Signal that our LeaseSet is ready (only once)
 	sm.leaseSetOnce.Do(func() {
@@ -771,7 +766,7 @@ func (sm *StreamManager) handleLeaseSet2(session *go_i2cp.Session, leaseSet *go_
 //   - remotePort: Remote port to send to
 func (sm *StreamManager) sendResetPacket(dest *go_i2cp.Destination, remoteStreamID uint32, localPort, remotePort uint16) {
 	if err := sm.validateResetPrerequisites(dest); err != nil {
-		log.Warn().Err(err).Msg("cannot send RESET")
+		log.WithError(err).Warn("cannot send RESET")
 		return
 	}
 
@@ -779,18 +774,18 @@ func (sm *StreamManager) sendResetPacket(dest *go_i2cp.Destination, remoteStream
 	sm.signResetPacket(pkt)
 
 	if err := sm.sendPacketToDest(pkt, dest, localPort, remotePort); err != nil {
-		log.Warn().Err(err).
-			Uint16("localPort", localPort).
-			Uint16("remotePort", remotePort).
-			Msg("failed to send RESET packet")
+		log.WithError(err).WithFields(map[string]interface{}{
+			"localPort":  localPort,
+			"remotePort": remotePort,
+		}).Warn("failed to send RESET packet")
 		return
 	}
 
-	log.Debug().
-		Uint32("remoteStreamID", remoteStreamID).
-		Uint16("localPort", localPort).
-		Uint16("remotePort", remotePort).
-		Msg("sent RESET packet")
+	log.WithFields(map[string]interface{}{
+		"remoteStreamID": remoteStreamID,
+		"localPort":      localPort,
+		"remotePort":     remotePort,
+	}).Debug("sent RESET packet")
 }
 
 // validateResetPrerequisites checks that dest and session are valid for sending RESET.
@@ -820,13 +815,13 @@ func (sm *StreamManager) createResetPacket(remoteStreamID uint32) *Packet {
 func (sm *StreamManager) signResetPacket(pkt *Packet) {
 	keyPair, err := sm.session.SigningKeyPair()
 	if err != nil {
-		log.Warn().Err(err).Msg("failed to get signing key pair for RESET packet - sending unsigned")
+		log.WithError(err).Warn("failed to get signing key pair for RESET packet - sending unsigned")
 		pkt.Flags &^= FlagSignatureIncluded
 		return
 	}
 
 	if err := SignPacket(pkt, keyPair); err != nil {
-		log.Warn().Err(err).Msg("failed to sign RESET packet - sending unsigned")
+		log.WithError(err).Warn("failed to sign RESET packet - sending unsigned")
 		pkt.Flags &^= FlagSignatureIncluded
 	}
 }
@@ -853,7 +848,7 @@ func (sm *StreamManager) Close() error {
 	sm.closed = true
 	sm.mu.Unlock()
 
-	log.Info().Msg("closing stream manager")
+	log.Info("closing stream manager")
 
 	// Stop packet processor
 	sm.processorCancel()

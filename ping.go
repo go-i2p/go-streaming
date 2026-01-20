@@ -203,18 +203,14 @@ func (pm *pingManager) signPingPacket(pkt *Packet) error {
 func (pm *pingManager) handlePong(pkt *Packet) {
 	// Per spec: pong has sendStreamId=0 and receiveStreamId=ping's sendStreamId
 	if pkt.SendStreamID != 0 {
-		log.Debug().
-			Uint32("sendStreamID", pkt.SendStreamID).
-			Msg("ignoring ECHO packet with non-zero sendStreamID (not a valid pong)")
+		log.WithField("sendStreamID", pkt.SendStreamID).Debug("ignoring ECHO packet with non-zero sendStreamID (not a valid pong)")
 		return
 	}
 
 	streamID := pkt.RecvStreamID
 	pendingIface, ok := pm.pendingPings.Load(streamID)
 	if !ok {
-		log.Debug().
-			Uint32("streamID", streamID).
-			Msg("received pong for unknown ping")
+		log.WithField("streamID", streamID).Debug("received pong for unknown ping")
 		return
 	}
 
@@ -229,14 +225,12 @@ func (pm *pingManager) handlePong(pkt *Packet) {
 	// Send result (non-blocking in case receiver is gone)
 	select {
 	case pending.resultCh <- result:
-		log.Debug().
-			Uint32("streamID", streamID).
-			Dur("rtt", rtt).
-			Msg("pong received")
+		log.WithFields(map[string]interface{}{
+			"streamID": streamID,
+			"rtt":      rtt,
+		}).Debug("pong received")
 	default:
-		log.Debug().
-			Uint32("streamID", streamID).
-			Msg("pong result channel full, discarding")
+		log.WithField("streamID", streamID).Debug("pong result channel full, discarding")
 	}
 }
 
@@ -248,13 +242,13 @@ func (pm *pingManager) handlePong(pkt *Packet) {
 //   - Payload from ping (up to 32 bytes) is echoed back
 func (pm *pingManager) handlePing(pkt *Packet, srcDest *go_i2cp.Destination, srcPort, destPort uint16) {
 	if !pm.config.AnswerPings {
-		log.Debug().Msg("ignoring ping (answerPings disabled)")
+		log.Debug("ignoring ping (answerPings disabled)")
 		return
 	}
 
 	// Validate ping packet per spec
 	if pkt.SendStreamID == 0 {
-		log.Debug().Msg("ignoring ECHO packet with zero sendStreamID (invalid ping)")
+		log.Debug("ignoring ECHO packet with zero sendStreamID (invalid ping)")
 		return
 	}
 
@@ -275,16 +269,14 @@ func (pm *pingManager) handlePing(pkt *Packet, srcDest *go_i2cp.Destination, src
 	}
 
 	if err := pm.sm.sendPacketToDest(pongPkt, srcDest, destPort, srcPort); err != nil {
-		log.Warn().Err(err).
-			Uint32("pingStreamID", pkt.SendStreamID).
-			Msg("failed to send pong")
+		log.WithError(err).WithField("pingStreamID", pkt.SendStreamID).Warn("failed to send pong")
 		return
 	}
 
-	log.Debug().
-		Uint32("pingStreamID", pkt.SendStreamID).
-		Int("payloadLen", len(payload)).
-		Msg("sent pong")
+	log.WithFields(map[string]interface{}{
+		"pingStreamID": pkt.SendStreamID,
+		"payloadLen":   len(payload),
+	}).Debug("sent pong")
 }
 
 // isPingPacket checks if a packet is a ping (ECHO with sendStreamId > 0).

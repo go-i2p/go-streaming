@@ -62,8 +62,10 @@ func DefaultProfileConfig() ProfileConfig {
 // Otherwise returns ProfileBulk (the default).
 func profileFromFlag(flags uint16) StreamProfile {
 	if flags&FlagProfileInteractive != 0 {
+		log.Debug("profile extracted from flags: interactive")
 		return ProfileInteractive
 	}
+	log.Debug("profile extracted from flags: bulk (default)")
 	return ProfileBulk
 }
 
@@ -71,7 +73,9 @@ func profileFromFlag(flags uint16) StreamProfile {
 // Only ProfileInteractive sets a flag (bit 8); ProfileBulk uses no flag.
 func profileToFlag(profile StreamProfile) uint16 {
 	if profile == ProfileInteractive {
+		log.Debug("converting interactive profile to flag")
 		return FlagProfileInteractive
 	}
+	log.Debug("converting bulk profile to flag (no flag set)")
 	return 0
 }

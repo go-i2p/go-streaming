@@ -85,12 +85,12 @@ func (t *messageStatusTracker) TrackMessage(conn *StreamConn, seqNum uint32, pay
 	atomic.AddUint64(&t.stats.TotalSent, 1)
 	t.mu.Unlock()
 
-	log.Trace().
-		Uint32("nonce", nonce).
-		Uint32("seq", seqNum).
-		Int("payloadSize", payloadSize).
-		Bool("isDataPkt", isDataPkt).
-		Msg("tracking outgoing message")
+	log.WithFields(map[string]interface{}{
+		"nonce":       nonce,
+		"seq":         seqNum,
+		"payloadSize": payloadSize,
+		"isDataPkt":   isDataPkt,
+	}).Debug("tracking outgoing message")
 
 	return nonce
 }
@@ -103,10 +103,10 @@ func (t *messageStatusTracker) HandleStatus(messageId uint32, status go_i2cp.Ses
 	if !exists {
 		t.mu.Unlock()
 		// Message not tracked - might be using nonce=0 (legacy) or already processed
-		log.Trace().
-			Uint32("messageId", messageId).
-			Uint8("status", uint8(status)).
-			Msg("received status for untracked message")
+		log.WithFields(map[string]interface{}{
+			"messageId": messageId,
+			"status":    uint8(status),
+		}).Debug("received status for untracked message")
 		return
 	}
 	delete(t.pendingMessages, messageId)
@@ -137,12 +137,12 @@ func (t *messageStatusTracker) handleSuccess(info *pendingMessageInfo, status go
 
 	category := go_i2cp.GetMessageStatusCategory(status)
 
-	log.Debug().
-		Uint32("nonce", info.nonce).
-		Uint32("seq", info.seqNum).
-		Str("status", category).
-		Dur("deliveryTime", deliveryTime).
-		Msg("message delivered successfully")
+	log.WithFields(map[string]interface{}{
+		"nonce":        info.nonce,
+		"seq":          info.seqNum,
+		"status":       category,
+		"deliveryTime": deliveryTime,
+	}).Debug("message delivered successfully")
 
 	// Notify the connection if it's a data packet
 	if info.isDataPkt && info.conn != nil {
@@ -157,15 +157,15 @@ func (t *messageStatusTracker) handleFailure(info *pendingMessageInfo, status go
 	category := go_i2cp.GetMessageStatusCategory(status)
 	retriable := go_i2cp.IsMessageStatusRetriable(status)
 
-	log.Warn().
-		Uint32("nonce", info.nonce).
-		Uint32("seq", info.seqNum).
-		Uint8("status", uint8(status)).
-		Str("category", category).
-		Bool("retriable", retriable).
-		Int("retryCount", info.retryCount).
-		Dur("afterTime", deliveryTime).
-		Msg("message delivery failed")
+	log.WithFields(map[string]interface{}{
+		"nonce":      info.nonce,
+		"seq":        info.seqNum,
+		"status":     uint8(status),
+		"category":   category,
+		"retriable":  retriable,
+		"retryCount": info.retryCount,
+		"afterTime":  deliveryTime,
+	}).Warn("message delivery failed")
 
 	// For retriable failures, trigger retransmission
 	if retriable && info.retryCount < info.maxRetries && info.isDataPkt && info.conn != nil {
@@ -181,11 +181,11 @@ func (t *messageStatusTracker) handleFailure(info *pendingMessageInfo, status go
 func (t *messageStatusTracker) handleIntermediate(info *pendingMessageInfo, status go_i2cp.SessionMessageStatus) {
 	category := go_i2cp.GetMessageStatusCategory(status)
 
-	log.Trace().
-		Uint32("nonce", info.nonce).
-		Uint32("seq", info.seqNum).
-		Str("status", category).
-		Msg("message status update (intermediate)")
+	log.WithFields(map[string]interface{}{
+		"nonce":  info.nonce,
+		"seq":    info.seqNum,
+		"status": category,
+	}).Debug("message status update (intermediate)")
 
 	// Re-add to pending for final status
 	// Note: go-i2cp's PendingMessage tracking handles this internally
@@ -226,11 +226,11 @@ func (t *messageStatusTracker) CleanupExpired(maxAge time.Duration) int {
 			expired++
 			atomic.AddUint64(&t.stats.TotalExpired, 1)
 
-			log.Warn().
-				Uint32("nonce", nonce).
-				Uint32("seq", info.seqNum).
-				Dur("age", now.Sub(info.sentAt)).
-				Msg("message expired without status")
+			log.WithFields(map[string]interface{}{
+				"nonce": nonce,
+				"seq":   info.seqNum,
+				"age":   now.Sub(info.sentAt),
+			}).Warn("message expired without status")
 
 			// Treat as failure for data packets
 			if info.isDataPkt && info.conn != nil {
@@ -246,5 +246,6 @@ func (t *messageStatusTracker) CleanupExpired(maxAge time.Duration) int {
 func (t *messageStatusTracker) Clear() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	log.WithField("pendingCleared", len(t.pendingMessages)).Debug("clearing message status tracker")
 	t.pendingMessages = make(map[uint32]*pendingMessageInfo)
 }

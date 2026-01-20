@@ -71,6 +71,7 @@ func newAccessFilter(config *AccessListConfig) *accessFilter {
 
 // SetConfig updates the filter configuration and rebuilds the hash set.
 func (af *accessFilter) SetConfig(config *AccessListConfig) {
+	log.Debug("updating access filter configuration")
 	af.mu.Lock()
 	defer af.mu.Unlock()
 	if config == nil {
@@ -78,6 +79,10 @@ func (af *accessFilter) SetConfig(config *AccessListConfig) {
 	}
 	af.config = config
 	af.rebuildHashSet()
+	log.WithFields(map[string]interface{}{
+		"mode":      int(config.Mode),
+		"hashCount": len(af.hashSet),
+	}).Debug("access filter configuration updated")
 }
 
 // GetConfig returns a copy of the current configuration.
@@ -121,7 +126,7 @@ func normalizeHash(hash string) string {
 			// Try URL-safe Base64 (I2P uses this)
 			decoded, err = base64.RawStdEncoding.DecodeString(hash)
 			if err != nil {
-				log.Warn().Str("hash", hash).Msg("invalid Base64 hash in access list")
+				log.WithField("hash", hash).Warn("invalid Base64 hash in access list")
 				return ""
 			}
 		}
@@ -141,11 +146,13 @@ func (af *accessFilter) IsAllowed(dest *go_i2cp.Destination) bool {
 
 	// If disabled, allow all
 	if af.config.Mode == AccessListModeDisabled {
+		log.Debug("access list disabled, allowing connection")
 		return true
 	}
 
 	// If no destination provided, we can't check - allow by default
 	if dest == nil {
+		log.Debug("no destination provided, allowing connection by default")
 		return true
 	}
 
@@ -230,19 +237,21 @@ func logDestinationRejected(dest *go_i2cp.Destination, reason string) {
 		}
 	}
 
-	log.Warn().
-		Str("peer", peerID).
-		Str("reason", reason).
-		Msg("incoming connection rejected by access list")
+	log.WithFields(map[string]interface{}{
+		"peer":   peerID,
+		"reason": reason,
+	}).Warn("incoming connection rejected by access list")
 }
 
 // AddHash adds a hash to the access list.
 func (af *accessFilter) AddHash(hash string) {
+	log.WithField("hash", hash).Debug("adding hash to access list")
 	af.mu.Lock()
 	defer af.mu.Unlock()
 
 	normalized := normalizeHash(hash)
 	if normalized == "" {
+		log.WithField("hash", hash).Debug("hash normalization failed, skipping")
 		return
 	}
 
@@ -250,15 +259,18 @@ func (af *accessFilter) AddHash(hash string) {
 	af.config.Hashes = append(af.config.Hashes, hash)
 	// Add to hash set
 	af.hashSet[normalized] = struct{}{}
+	log.WithField("count", len(af.hashSet)).Debug("hash added to access list")
 }
 
 // RemoveHash removes a hash from the access list.
 func (af *accessFilter) RemoveHash(hash string) {
+	log.WithField("hash", hash).Debug("removing hash from access list")
 	af.mu.Lock()
 	defer af.mu.Unlock()
 
 	normalized := normalizeHash(hash)
 	if normalized == "" {
+		log.WithField("hash", hash).Debug("hash normalization failed, skipping removal")
 		return
 	}
 
@@ -273,15 +285,18 @@ func (af *accessFilter) RemoveHash(hash string) {
 		}
 	}
 	af.config.Hashes = newHashes
+	log.WithField("count", len(af.hashSet)).Debug("hash removed from access list")
 }
 
 // Clear removes all hashes from the access list.
 func (af *accessFilter) Clear() {
+	log.Debug("clearing access list")
 	af.mu.Lock()
 	defer af.mu.Unlock()
 
 	af.config.Hashes = nil
 	af.hashSet = make(map[string]struct{})
+	log.Debug("access list cleared")
 }
 
 // Count returns the number of hashes in the access list.

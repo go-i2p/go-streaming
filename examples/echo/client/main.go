@@ -34,13 +34,13 @@ import (
 
 	go_i2cp "github.com/go-i2p/go-i2cp"
 	streaming "github.com/go-i2p/go-streaming"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
+	"github.com/go-i2p/logger"
 )
 
+var log = logger.GetGoI2PLogger()
+
 func main() {
-	configureLogging()
-	log.Info().Msg("starting I2P echo client")
+	log.Info("starting I2P echo client")
 
 	serverDestB64 := parseServerDestination()
 
@@ -61,18 +61,11 @@ func main() {
 	runEchoTestOrFail(conn)
 }
 
-// configureLogging sets up the zerolog logger with console output and standard formatting.
-func configureLogging() {
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
-}
-
 // parseServerDestination parses the server destination from command line arguments.
 // It terminates the program with a fatal error if no destination is provided.
 func parseServerDestination() string {
 	if len(os.Args) < 2 {
-		log.Fatal().Msg("usage: client <server-destination-base64>")
+		log.Fatal("usage: client <server-destination-base64>")
 	}
 	return os.Args[1]
 }
@@ -85,12 +78,12 @@ func createI2CPClient() *go_i2cp.Client {
 	connCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	log.Info().Msg("connecting to I2P router at 127.0.0.1:7654")
+	log.Info("connecting to I2P router at 127.0.0.1:7654")
 	if err := client.Connect(connCtx); err != nil {
-		log.Fatal().Err(err).Msg("failed to connect to I2P router")
+		log.WithError(err).Fatal("failed to connect to I2P router")
 	}
 
-	log.Info().Msg("connected to I2P router")
+	log.Info("connected to I2P router")
 	return client
 }
 
@@ -99,11 +92,11 @@ func createI2CPClient() *go_i2cp.Client {
 func createStreamManager(client *go_i2cp.Client) *streaming.StreamManager {
 	manager, err := streaming.NewStreamManager(client)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to create stream manager")
+		log.WithError(err).Fatal("failed to create stream manager")
 	}
 
 	if err := manager.StartSession(context.Background()); err != nil {
-		log.Fatal().Err(err).Msg("failed to start session")
+		log.WithError(err).Fatal("failed to start session")
 	}
 
 	return manager
@@ -113,14 +106,14 @@ func createStreamManager(client *go_i2cp.Client) *streaming.StreamManager {
 // I2CP I/O operations. This is required for callbacks to function properly.
 func startProcessIOLoop(client *go_i2cp.Client) {
 	go func() {
-		log.Info().Msg("starting I2CP ProcessIO loop")
+		log.Info("starting I2CP ProcessIO loop")
 		for {
 			if err := client.ProcessIO(context.Background()); err != nil {
 				if err == go_i2cp.ErrClientClosed {
-					log.Info().Msg("I2CP client closed")
+					log.Info("I2CP client closed")
 					return
 				}
-				log.Error().Err(err).Msg("I/O processing error")
+				log.WithError(err).Error("I/O processing error")
 				time.Sleep(time.Second)
 			}
 		}
@@ -130,11 +123,11 @@ func startProcessIOLoop(client *go_i2cp.Client) {
 // parseDestinationFromBase64 parses an I2P destination from its base64 representation.
 // It terminates the program with a fatal error if parsing fails.
 func parseDestinationFromBase64(destB64 string) *go_i2cp.Destination {
-	log.Info().Msg("parsing server destination")
+	log.Info("parsing server destination")
 	crypto := go_i2cp.NewCrypto()
 	dest, err := go_i2cp.NewDestinationFromBase64(destB64, crypto)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to parse server destination")
+		log.WithError(err).Fatal("failed to parse server destination")
 	}
 	return dest
 }
@@ -146,20 +139,20 @@ func connectToServer(manager *streaming.StreamManager, dest *go_i2cp.Destination
 	const remotePort = 8080
 	const connectTimeout = 30 * time.Second
 
-	log.Info().
-		Str("destination", "<server-dest>").
-		Uint16("remote_port", remotePort).
-		Msg("connecting to server")
+	log.WithFields(logger.Fields{
+		"destination": "<server-dest>",
+		"remote_port": remotePort,
+	}).Info("connecting to server")
 
 	conn, err := dialWithManager(manager, dest, localPort, remotePort, 1730, connectTimeout)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to connect")
+		log.WithError(err).Fatal("failed to connect")
 	}
 
-	log.Info().
-		Str("local", conn.LocalAddr().String()).
-		Str("remote", conn.RemoteAddr().String()).
-		Msg("connected")
+	log.WithFields(logger.Fields{
+		"local":  conn.LocalAddr().String(),
+		"remote": conn.RemoteAddr().String(),
+	}).Info("connected")
 
 	return conn
 }
@@ -168,9 +161,9 @@ func connectToServer(manager *streaming.StreamManager, dest *go_i2cp.Destination
 func runEchoTestOrFail(conn *streaming.StreamConn) {
 	testCtx := context.Background()
 	if err := runEchoTest(testCtx, conn); err != nil {
-		log.Fatal().Err(err).Msg("echo test failed")
+		log.WithError(err).Fatal("echo test failed")
 	}
-	log.Info().Msg("echo test completed successfully")
+	log.Info("echo test completed successfully")
 }
 
 // dialWithManager is a helper to create a connection using StreamManager.
@@ -222,11 +215,11 @@ func runEchoTest(ctx context.Context, conn net.Conn) error {
 
 // runSingleEchoTest sends a single test message and verifies the echoed response.
 func runSingleEchoTest(conn net.Conn, testNum, totalTests int, msg string) error {
-	log.Info().
-		Int("test", testNum).
-		Int("total", totalTests).
-		Str("message", msg).
-		Msg("sending test message")
+	log.WithFields(logger.Fields{
+		"test":    testNum,
+		"total":   totalTests,
+		"message": msg,
+	}).Info("sending test message")
 
 	start := time.Now()
 
@@ -247,11 +240,11 @@ func runSingleEchoTest(conn net.Conn, testNum, totalTests int, msg string) error
 		return err
 	}
 
-	log.Info().
-		Int("test", testNum).
-		Int("bytes", len(response)).
-		Dur("rtt", rtt).
-		Msg("echo verified")
+	log.WithFields(logger.Fields{
+		"test":  testNum,
+		"bytes": len(response),
+		"rtt":   rtt,
+	}).Info("echo verified")
 
 	return nil
 }
@@ -263,9 +256,7 @@ func sendTestMessage(conn net.Conn, msg string) error {
 		return fmt.Errorf("write failed: %w", err)
 	}
 
-	log.Debug().
-		Int("bytes_sent", n).
-		Msg("message sent")
+	log.WithField("bytes_sent", n).Debug("message sent")
 
 	return nil
 }

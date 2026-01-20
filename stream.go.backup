@@ -1180,10 +1180,10 @@ func (l *StreamListener) initConnectionState(synPkt *Packet, remotePort uint16, 
 func (l *StreamListener) queueConnectionForAccept(conn *StreamConn, remotePort uint16) error {
 	select {
 	case l.acceptChan <- conn:
-		log.WithFields(map[string]interface{}{
-			"localPort":  l.localPort,
-			"remotePort": remotePort,
-		}).Debug("queued connection for Accept()")
+		log.Debug().
+			Uint16("localPort", l.localPort).
+			Uint16("remotePort", remotePort).
+			Msg("queued connection for Accept()")
 		return nil
 	default:
 		log.Warn("accept channel full, dropping connection")
@@ -1197,11 +1197,11 @@ func (l *StreamListener) queueConnectionForAccept(conn *StreamConn, remotePort u
 
 // handleIncomingSYN processes an incoming SYN packet to establish a new connection.
 func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16, remoteDest *go_i2cp.Destination) error {
-	log.WithFields(map[string]interface{}{
-		"remoteSeq":  synPkt.SequenceNum,
-		"remotePort": remotePort,
-		"localPort":  l.localPort,
-	}).Debug("received SYN")
+	log.Debug().
+		Uint32("remoteSeq", synPkt.SequenceNum).
+		Uint16("remotePort", remotePort).
+		Uint16("localPort", l.localPort).
+		Msg("received SYN")
 
 	// Check access list before anything else
 	if err := l.checkAccessFilter(remoteDest, synPkt); err != nil {
@@ -1387,12 +1387,10 @@ func (s *StreamConn) transmitSynAckPacket(pkt *Packet) error {
 
 // logSentSynAck logs debug information about the sent SYN-ACK packet.
 func (s *StreamConn) logSentSynAck(pkt *Packet) {
-	log.WithFields(map[string]interface{}{
-		"seq":      pkt.SequenceNum,
-		"ack":      pkt.AckThrough,
-		"flags":    pkt.Flags,
-		"localMTU": s.localMTU,
-	}).Debug("sent SYN-ACK")
+	log.Debug().
+		Uint32("seq", pkt.SequenceNum).Uint32("ack", pkt.AckThrough).
+		Uint16("flags", pkt.Flags).Uint16("localMTU", s.localMTU).
+		Msg("sent SYN-ACK")
 }
 
 // validateWriteStateLocked checks if the connection is in a valid state for writing.
@@ -1449,7 +1447,9 @@ func (s *StreamConn) waitForChokeCondVar() error {
 			return err
 		}
 
-		log.WithField("chokedUntil", s.chokedUntil).Debug("peer is choked - waiting for unchoke or timeout")
+		log.Debug().
+			Time("chokedUntil", s.chokedUntil).
+			Msg("peer is choked - waiting for unchoke or timeout")
 
 		timer, timerChan := s.createChokeTimer()
 		done := s.waitWithTimerSignal(timerChan)
@@ -1504,7 +1504,9 @@ func (s *StreamConn) waitForChokeFallback() error {
 		return &timeoutError{}
 	}
 
-	log.WithField("waitDuration", waitDuration).Debug("peer is choked - waiting before sending (fallback)")
+	log.Debug().
+		Dur("waitDuration", waitDuration).
+		Msg("peer is choked - waiting before sending (fallback)")
 
 	s.mu.Unlock()
 	time.Sleep(waitDuration)
@@ -1539,10 +1541,10 @@ func (s *StreamConn) waitForWindowSpace(bytesWritten int) error {
 			return err
 		}
 
-		log.WithFields(map[string]interface{}{
-			"inFlight": len(s.sentPackets),
-			"cwnd":     s.cwnd,
-		}).Debug("window full - waiting for ACKs")
+		log.Debug().
+			Int("inFlight", len(s.sentPackets)).
+			Uint32("cwnd", s.cwnd).
+			Msg("window full - waiting for ACKs")
 
 		timer, done := s.setupWindowWaitTimer()
 
@@ -1641,21 +1643,21 @@ func (s *StreamConn) writeDataLocked(data []byte) (int, error) {
 	total := len(data)
 	mtu := int(s.getNegotiatedMTULocked())
 
-	log.WithFields(map[string]interface{}{
-		"bytes":    total,
-		"mtu":      mtu,
-		"startSeq": s.sendSeq,
-	}).Debug("writing data")
+	log.Debug().
+		Int("bytes", total).
+		Int("mtu", mtu).
+		Uint32("startSeq", s.sendSeq).
+		Msg("writing data")
 
 	written, err := s.writeChunksLocked(data, total, mtu)
 	if err != nil {
 		return written, err
 	}
 
-	log.WithFields(map[string]interface{}{
-		"bytes":  total,
-		"endSeq": s.sendSeq,
-	}).Debug("write complete")
+	log.Debug().
+		Int("bytes", total).
+		Uint32("endSeq", s.sendSeq).
+		Msg("write complete")
 
 	return total, nil
 }
@@ -1779,7 +1781,9 @@ func (s *StreamConn) consumeBufferDataLocked(buf []byte) (int, error) {
 		}
 	}
 
-	log.WithField("bytes", n).Debug("read data")
+	log.Debug().
+		Int("bytes", n).
+		Msg("read data")
 	return n, nil
 }
 
@@ -1797,7 +1801,7 @@ func (s *StreamConn) handlePostReadActionsLocked() {
 
 		if bufferUsage < 0.3 {
 			if err := s.sendUnchokeSignalLocked(); err != nil {
-				log.WithError(err).Warn("failed to send unchoke signal after read")
+				log.Warn().Err(err).Msg("failed to send unchoke signal after read")
 			}
 		}
 	}
@@ -1881,7 +1885,7 @@ func (s *StreamConn) retransmitTimer() {
 		case <-ticker.C:
 			if err := s.checkRetransmissions(); err != nil {
 				// Fatal error (max retries exceeded) - close connection
-				log.WithError(err).Error("retransmission failed, closing connection")
+				log.Error().Err(err).Msg("retransmission failed, closing connection")
 				s.Close()
 				return
 			}
@@ -1915,11 +1919,11 @@ func (s *StreamConn) applyExponentialBackoffLocked(timedOutCount int) {
 		s.rto = MaxRTO
 	}
 
-	log.WithFields(map[string]interface{}{
-		"count":  timedOutCount,
-		"oldRTO": oldRTO,
-		"newRTO": s.rto,
-	}).Debug("packets timed out, applying exponential backoff")
+	log.Debug().
+		Int("count", timedOutCount).
+		Dur("oldRTO", oldRTO).
+		Dur("newRTO", s.rto).
+		Msg("packets timed out, applying exponential backoff")
 }
 
 // retransmitTimedOutPacketsLocked retransmits all timed-out packets.
@@ -1931,24 +1935,27 @@ func (s *StreamConn) retransmitTimedOutPacketsLocked(timedOutSeqs []uint32) erro
 
 		// Check max retries BEFORE incrementing (retransmitPacketLocked will increment)
 		if info.retryCount >= MaxRetransmissions {
-			log.WithFields(map[string]interface{}{
-				"seq":     seq,
-				"retries": info.retryCount,
-			}).Error("max retransmissions exceeded")
+			log.Error().
+				Uint32("seq", seq).
+				Int("retries", info.retryCount).
+				Msg("max retransmissions exceeded")
 			return fmt.Errorf("max retransmissions exceeded for packet %d", seq)
 		}
 
 		// Retransmit packet (this will increment retryCount and update sentTime)
 		if err := s.retransmitPacketLocked(seq); err != nil {
-			log.WithError(err).WithField("seq", seq).Warn("timeout retransmission failed")
+			log.Warn().
+				Err(err).
+				Uint32("seq", seq).
+				Msg("timeout retransmission failed")
 			continue
 		}
 
-		log.WithFields(map[string]interface{}{
-			"seq":        seq,
-			"retryCount": info.retryCount,
-			"rto":        s.rto,
-		}).Debug("retransmitted packet due to timeout")
+		log.Debug().
+			Uint32("seq", seq).
+			Int("retryCount", info.retryCount).
+			Dur("rto", s.rto).
+			Msg("retransmitted packet due to timeout")
 	}
 
 	return nil
@@ -2014,15 +2021,15 @@ func (s *StreamConn) checkInactivity() {
 		return
 	}
 
-	log.WithFields(map[string]interface{}{
-		"inactive": inactiveDuration,
-		"timeout":  s.inactivityTimeout,
-	}).Debug("inactivity timeout reached - sending keepalive ACK")
+	log.Debug().
+		Dur("inactive", inactiveDuration).
+		Dur("timeout", s.inactivityTimeout).
+		Msg("inactivity timeout reached - sending keepalive ACK")
 
 	// Send a duplicate ACK as keepalive (i2p.streaming.inactivityAction = 1)
 	// This signals we're still alive without consuming sequence numbers
 	if err := s.sendAckLocked(); err != nil {
-		log.WithError(err).Warn("failed to send keepalive ACK")
+		log.Warn().Err(err).Msg("failed to send keepalive ACK")
 		return
 	}
 
@@ -2058,7 +2065,10 @@ func (s *StreamConn) receiveLoop() {
 		case pkt := <-s.recvChan:
 			// Process packet from manager
 			if err := s.processPacket(pkt); err != nil {
-				log.WithError(err).WithField("seq", pkt.SequenceNum).Warn("failed to process packet")
+				log.Warn().
+					Err(err).
+					Uint32("seq", pkt.SequenceNum).
+					Msg("failed to process packet")
 			}
 		}
 	}
@@ -2077,13 +2087,10 @@ func (s *StreamConn) processPacket(pkt *Packet) error {
 
 // logProcessingPacket logs debug information about the packet being processed.
 func (s *StreamConn) logProcessingPacket(pkt *Packet) {
-	log.WithFields(map[string]interface{}{
-		"seq":     pkt.SequenceNum,
-		"ack":     pkt.AckThrough,
-		"flags":   pkt.Flags,
-		"payload": len(pkt.Payload),
-		"state":   s.state.String(),
-	}).Debug("processing packet")
+	log.Debug().
+		Uint32("seq", pkt.SequenceNum).Uint32("ack", pkt.AckThrough).
+		Uint16("flags", pkt.Flags).Int("payload", len(pkt.Payload)).
+		Str("state", s.state.String()).Msg("processing packet")
 }
 
 // dispatchPacketByFlags routes the packet to the appropriate handler based on flags.
@@ -2117,7 +2124,7 @@ func (s *StreamConn) dispatchPacketByFlags(pkt *Packet) error {
 	case len(pkt.Payload) > 0:
 		return s.handleDataLocked(pkt)
 	default:
-		log.WithField("flags", pkt.Flags).Debug("packet with no recognized flags")
+		log.Debug().Uint16("flags", pkt.Flags).Msg("packet with no recognized flags")
 	}
 	return nil
 }
@@ -2126,11 +2133,15 @@ func (s *StreamConn) dispatchPacketByFlags(pkt *Packet) error {
 // Must be called with s.mu held.
 func (s *StreamConn) handleSynAckLocked(pkt *Packet) error {
 	if s.state != StateSynSent {
-		log.WithField("state", s.state.String()).Warn("unexpected SYN-ACK in state")
+		log.Warn().
+			Str("state", s.state.String()).
+			Msg("unexpected SYN-ACK in state")
 		return fmt.Errorf("unexpected SYN-ACK")
 	}
 
-	log.WithField("remoteSeq", pkt.SequenceNum).Debug("received SYN-ACK")
+	log.Debug().
+		Uint32("remoteSeq", pkt.SequenceNum).
+		Msg("received SYN-ACK")
 
 	// Extract remote ISN and MTU
 	s.recvSeq = pkt.SequenceNum + 1 // Next expected sequence
@@ -2138,11 +2149,11 @@ func (s *StreamConn) handleSynAckLocked(pkt *Packet) error {
 	// Extract MTU from packet if present (FlagMaxPacketSizeIncluded)
 	if pkt.Flags&FlagMaxPacketSizeIncluded != 0 && pkt.MaxPacketSize > 0 {
 		s.remoteMTU = pkt.MaxPacketSize
-		log.WithFields(map[string]interface{}{
-			"remoteMTU":     s.remoteMTU,
-			"localMTU":      s.localMTU,
-			"negotiatedMTU": s.getNegotiatedMTULocked(),
-		}).Debug("MTU negotiated")
+		log.Debug().
+			Uint16("remoteMTU", s.remoteMTU).
+			Uint16("localMTU", s.localMTU).
+			Uint16("negotiatedMTU", s.getNegotiatedMTULocked()).
+			Msg("MTU negotiated")
 	} else {
 		s.remoteMTU = DefaultMTU
 		log.Warn("SYN-ACK missing MTU, using default")
@@ -2162,14 +2173,16 @@ func (s *StreamConn) handleSynAckLocked(pkt *Packet) error {
 // handleFinalAckLocked processes the final ACK of handshake (server side).
 // Must be called with s.mu held.
 func (s *StreamConn) handleFinalAckLocked(pkt *Packet) error {
-	log.WithField("ack", pkt.AckThrough).Debug("received final ACK")
+	log.Debug().
+		Uint32("ack", pkt.AckThrough).
+		Msg("received final ACK")
 
 	// Verify ACK is for our SYN-ACK
 	if pkt.AckThrough != s.sendSeq-1 {
-		log.WithFields(map[string]interface{}{
-			"expected": s.sendSeq - 1,
-			"got":      pkt.AckThrough,
-		}).Warn("ACK number mismatch")
+		log.Warn().
+			Uint32("expected", s.sendSeq-1).
+			Uint32("got", pkt.AckThrough).
+			Msg("ACK number mismatch")
 	}
 
 	// Initialize ackThrough from the final ACK of the 3-way handshake.
@@ -2189,10 +2202,10 @@ func (s *StreamConn) handleFinalAckLocked(pkt *Packet) error {
 	// Start inactivity timer for keepalive detection
 	go s.inactivityTimer()
 
-	log.WithFields(map[string]interface{}{
-		"state":         s.state.String(),
-		"negotiatedMTU": s.getNegotiatedMTULocked(),
-	}).Info("server-side connection established")
+	log.Info().
+		Str("state", s.state.String()).
+		Uint16("negotiatedMTU", s.getNegotiatedMTULocked()).
+		Msg("server-side connection established")
 
 	return nil
 }
@@ -2205,7 +2218,7 @@ func (s *StreamConn) handleCloseLocked(pkt *Packet) error {
 	// Verify CLOSE signature if present
 	if pkt.Flags&FlagSignatureIncluded != 0 {
 		if err := VerifyPacketSignature(pkt, nil); err != nil {
-			log.WithError(err).Warn("CLOSE signature verification failed - rejecting packet")
+			log.Warn().Err(err).Msg("CLOSE signature verification failed - rejecting packet")
 			return fmt.Errorf("CLOSE signature verification failed: %w", err)
 		}
 		log.Debug("CLOSE signature verified successfully")
@@ -2215,7 +2228,7 @@ func (s *StreamConn) handleCloseLocked(pkt *Packet) error {
 	case StateEstablished:
 		// Peer initiated close - send CLOSE response
 		if err := s.sendCloseLocked(); err != nil {
-			log.WithError(err).Warn("failed to send CLOSE response")
+			log.Warn().Err(err).Msg("failed to send CLOSE response")
 		}
 		s.setState(StateClosed)
 		s.closed = true
@@ -2228,7 +2241,9 @@ func (s *StreamConn) handleCloseLocked(pkt *Packet) error {
 		s.recvCond.Broadcast()
 
 	default:
-		log.WithField("state", s.state.String()).Warn("unexpected CLOSE")
+		log.Warn().
+			Str("state", s.state.String()).
+			Msg("unexpected CLOSE")
 	}
 
 	return nil
@@ -2242,7 +2257,7 @@ func (s *StreamConn) handleResetLocked(pkt *Packet) error {
 	// Verify RESET signature if present
 	if pkt.Flags&FlagSignatureIncluded != 0 {
 		if err := VerifyPacketSignature(pkt, nil); err != nil {
-			log.WithError(err).Warn("RESET signature verification failed - rejecting packet")
+			log.Warn().Err(err).Msg("RESET signature verification failed - rejecting packet")
 			return fmt.Errorf("RESET signature verification failed: %w", err)
 		}
 		log.Debug("RESET signature verified successfully")
@@ -2264,11 +2279,11 @@ func (s *StreamConn) updateRTTEstimate(rtt time.Duration) {
 	if s.srtt == 0 {
 		s.srtt = rtt
 		s.rttVariance = rtt / 2
-		log.WithFields(map[string]interface{}{
-			"rtt":    rtt,
-			"srtt":   s.srtt,
-			"rttVar": s.rttVariance,
-		}).Debug("first RTT measurement")
+		log.Debug().
+			Dur("rtt", rtt).
+			Dur("srtt", s.srtt).
+			Dur("rttVar", s.rttVariance).
+			Msg("first RTT measurement")
 		return
 	}
 
@@ -2285,11 +2300,11 @@ func (s *StreamConn) updateRTTEstimate(rtt time.Duration) {
 	s.rttVariance = time.Duration(float64(s.rttVariance)*(1-beta) + beta*float64(diff))
 	s.srtt = time.Duration(float64(s.srtt)*(1-alpha) + alpha*float64(rtt))
 
-	log.WithFields(map[string]interface{}{
-		"rtt":    rtt,
-		"srtt":   s.srtt,
-		"rttVar": s.rttVariance,
-	}).Debug("updated RTT estimate")
+	log.Debug().
+		Dur("rtt", rtt).
+		Dur("srtt", s.srtt).
+		Dur("rttVar", s.rttVariance).
+		Msg("updated RTT estimate")
 }
 
 // calculateRTO calculates and sets the retransmission timeout.
@@ -2305,7 +2320,9 @@ func (s *StreamConn) calculateRTO() {
 		s.rto = MaxRTO
 	}
 
-	log.WithField("rto", s.rto).Debug("calculated RTO")
+	log.Debug().
+		Dur("rto", s.rto).
+		Msg("calculated RTO")
 }
 
 // getResendDelaySeconds returns the current RTO as a uint8 value in seconds.
@@ -2347,21 +2364,21 @@ func (s *StreamConn) updateCongestionWindow() {
 		s.cwnd = min(s.cwnd*2, s.ssthresh)
 		s.windowSize = s.cwnd
 
-		log.WithFields(map[string]interface{}{
-			"oldCwnd":  oldCwnd,
-			"newCwnd":  s.cwnd,
-			"ssthresh": s.ssthresh,
-		}).Debug("slow start: doubled window")
+		log.Debug().
+			Uint32("oldCwnd", oldCwnd).
+			Uint32("newCwnd", s.cwnd).
+			Uint32("ssthresh", s.ssthresh).
+			Msg("slow start: doubled window")
 	} else {
 		oldCwnd := s.cwnd
 		s.cwnd = min(s.cwnd+1, MaxWindowSize)
 		s.windowSize = s.cwnd
 
-		log.WithFields(map[string]interface{}{
-			"oldCwnd":   oldCwnd,
-			"newCwnd":   s.cwnd,
-			"maxWindow": MaxWindowSize,
-		}).Debug("congestion avoidance: incremented window")
+		log.Debug().
+			Uint32("oldCwnd", oldCwnd).
+			Uint32("newCwnd", s.cwnd).
+			Uint32("maxWindow", MaxWindowSize).
+			Msg("congestion avoidance: incremented window")
 	}
 }
 
@@ -2380,7 +2397,9 @@ func (s *StreamConn) handleNACKsLocked(nacks []uint32) {
 		s.nackCounts = make(map[uint32]int)
 	}
 
-	log.WithField("nackCount", len(nacks)).Debug("processing NACK requests")
+	log.Debug().
+		Int("nackCount", len(nacks)).
+		Msg("processing NACK requests")
 
 	// Track which sequences triggered fast retransmit this round
 	retransmitTriggered := false
@@ -2390,11 +2409,11 @@ func (s *StreamConn) handleNACKsLocked(nacks []uint32) {
 		s.nackCounts[nackSeq]++
 		count := s.nackCounts[nackSeq]
 
-		log.WithFields(map[string]interface{}{
-			"seq":       nackSeq,
-			"nackCount": count,
-			"threshold": FastRetransmitThreshold,
-		}).Debug("received NACK for sequence")
+		log.Debug().
+			Uint32("seq", nackSeq).
+			Int("nackCount", count).
+			Int("threshold", FastRetransmitThreshold).
+			Msg("received NACK for sequence")
 
 		// Only trigger fast retransmit after receiving threshold NACKs
 		if count >= FastRetransmitThreshold {
@@ -2405,12 +2424,15 @@ func (s *StreamConn) handleNACKsLocked(nacks []uint32) {
 			}
 
 			if err := s.retransmitPacketLocked(nackSeq); err != nil {
-				log.WithError(err).WithField("seq", nackSeq).Warn("fast retransmission failed")
+				log.Warn().
+					Err(err).
+					Uint32("seq", nackSeq).
+					Msg("fast retransmission failed")
 			} else {
-				log.WithFields(map[string]interface{}{
-					"seq":       nackSeq,
-					"nackCount": count,
-				}).Debug("fast retransmit triggered")
+				log.Debug().
+					Uint32("seq", nackSeq).
+					Int("nackCount", count).
+					Msg("fast retransmit triggered")
 			}
 
 			// Clear NACK count after retransmitting to avoid repeated retransmits
@@ -2431,12 +2453,12 @@ func (s *StreamConn) reduceCongestionWindowLocked() {
 	s.cwnd = s.ssthresh
 	s.windowSize = s.cwnd
 
-	log.WithFields(map[string]interface{}{
-		"oldCwnd":     oldCwnd,
-		"newCwnd":     s.cwnd,
-		"oldSsthresh": oldSsthresh,
-		"newSsthresh": s.ssthresh,
-	}).Debug("congestion detected: reduced window due to packet loss")
+	log.Debug().
+		Uint32("oldCwnd", oldCwnd).
+		Uint32("newCwnd", s.cwnd).
+		Uint32("oldSsthresh", oldSsthresh).
+		Uint32("newSsthresh", s.ssthresh).
+		Msg("congestion detected: reduced window due to packet loss")
 }
 
 // startPersistTimerLocked starts the persist timer for sending probe packets while choked.
@@ -2455,7 +2477,9 @@ func (s *StreamConn) startPersistTimerLocked() {
 	// Create timer that fires periodically
 	s.persistTimer = time.NewTimer(PersistProbeInterval)
 
-	log.WithField("interval", PersistProbeInterval).Debug("persist timer started for choke probing")
+	log.Debug().
+		Dur("interval", PersistProbeInterval).
+		Msg("persist timer started for choke probing")
 
 	// Start goroutine to handle timer events
 	go s.runPersistTimer(stopChan)
@@ -2533,7 +2557,7 @@ func (s *StreamConn) sendProbePacketLocked() {
 	// Marshal and send
 	data, err := pkt.Marshal()
 	if err != nil {
-		log.WithError(err).Warn("failed to marshal probe packet")
+		log.Warn().Err(err).Msg("failed to marshal probe packet")
 		return
 	}
 
@@ -2545,11 +2569,13 @@ func (s *StreamConn) sendProbePacketLocked() {
 	stream := go_i2cp.NewStream(data)
 	err = s.session.SendMessage(s.dest, 6, s.localPort, s.remotePort, stream, 0)
 	if err != nil {
-		log.WithError(err).Warn("failed to send probe packet")
+		log.Warn().Err(err).Msg("failed to send probe packet")
 		return
 	}
 
-	log.WithField("seq", pkt.SequenceNum).Debug("sent probe packet while choked")
+	log.Debug().
+		Uint32("seq", pkt.SequenceNum).
+		Msg("sent probe packet while choked")
 }
 
 // handleOptionalDelayLocked processes the choke/unchoke mechanism.
@@ -2565,10 +2591,10 @@ func (s *StreamConn) handleOptionalDelayLocked(pkt *Packet) {
 		wasChoked := s.choked
 		s.choked = true
 		s.chokedUntil = time.Now().Add(time.Second)
-		log.WithFields(map[string]interface{}{
-			"delay":       pkt.OptionalDelay,
-			"chokedUntil": s.chokedUntil,
-		}).Debug("peer is choked - pausing transmission")
+		log.Debug().
+			Uint16("delay", pkt.OptionalDelay).
+			Time("chokedUntil", s.chokedUntil).
+			Msg("peer is choked - pausing transmission")
 
 		// Start persist timer if not already running
 		if !wasChoked {
@@ -2588,7 +2614,9 @@ func (s *StreamConn) handleOptionalDelayLocked(pkt *Packet) {
 		}
 
 		if pkt.OptionalDelay > 0 {
-			log.WithField("delay", pkt.OptionalDelay).Debug("peer requests delay")
+			log.Debug().
+				Uint16("delay", pkt.OptionalDelay).
+				Msg("peer requests delay")
 		}
 	}
 }
@@ -2604,7 +2632,9 @@ func (s *StreamConn) handleAckLocked(pkt *Packet) error {
 	} else if seqGreaterThan(pkt.AckThrough, s.ackThrough) {
 		oldAck := s.ackThrough
 		s.ackThrough = pkt.AckThrough
-		log.WithField("ackThrough", s.ackThrough).Debug("updated ackThrough")
+		log.Debug().
+			Uint32("ackThrough", s.ackThrough).
+			Msg("updated ackThrough")
 
 		s.measureRTTFromAck(pkt.AckThrough)
 		s.cleanupAckedPacketsLocked(oldAck, pkt.AckThrough, pkt.NACKs)
@@ -2627,12 +2657,12 @@ func (s *StreamConn) handleBufferFullLocked(pkt *Packet, seq uint32) error {
 
 	if !s.sendingChoke {
 		if err := s.sendChokeSignalLocked(); err != nil {
-			log.WithError(err).Warn("failed to send choke signal")
+			log.Warn().Err(err).Msg("failed to send choke signal")
 		}
 	}
 
 	if err := s.sendAckLocked(); err != nil {
-		log.WithError(err).Warn("failed to send ACK during buffer full")
+		log.Warn().Err(err).Msg("failed to send ACK during buffer full")
 	}
 
 	return nil
@@ -2646,10 +2676,10 @@ func (s *StreamConn) processInSequencePacketLocked(pkt *Packet, seq uint32) erro
 		return s.handleBufferFullLocked(pkt, seq)
 	}
 
-	log.WithFields(map[string]interface{}{
-		"bytes": n,
-		"seq":   s.recvSeq,
-	}).Debug("buffered payload")
+	log.Debug().
+		Int("bytes", n).
+		Uint32("seq", s.recvSeq).
+		Msg("buffered payload")
 
 	s.recvSeq++
 	s.totalBytesReceived += uint64(n)
@@ -2666,7 +2696,7 @@ func (s *StreamConn) processInSequencePacketLocked(pkt *Packet, seq uint32) erro
 
 	if !s.sendingChoke || len(s.nackList) > 0 {
 		if err := s.sendAckLocked(); err != nil {
-			log.WithError(err).Warn("failed to send ACK")
+			log.Warn().Err(err).Msg("failed to send ACK")
 		}
 	}
 
@@ -2698,11 +2728,11 @@ func (s *StreamConn) calculateBufferUsage(currentBufferUsed int64) float64 {
 func (s *StreamConn) updateChokeStateForUsage(bufferUsage float64) {
 	if bufferUsage > 0.8 && !s.sendingChoke {
 		if err := s.sendChokeSignalLocked(); err != nil {
-			log.WithError(err).Warn("failed to send choke signal")
+			log.Warn().Err(err).Msg("failed to send choke signal")
 		}
 	} else if bufferUsage < 0.3 && s.sendingChoke {
 		if err := s.sendUnchokeSignalLocked(); err != nil {
-			log.WithError(err).Warn("failed to send unchoke signal")
+			log.Warn().Err(err).Msg("failed to send unchoke signal")
 		}
 	}
 }
@@ -2710,17 +2740,17 @@ func (s *StreamConn) updateChokeStateForUsage(bufferUsage float64) {
 // handleOutOfOrderPacketLocked handles a packet that arrived out of order.
 // Must be called with s.mu held.
 func (s *StreamConn) handleOutOfOrderPacketLocked(pkt *Packet, seq uint32) error {
-	log.WithFields(map[string]interface{}{
-		"expected": s.recvSeq,
-		"got":      seq,
-	}).Debug("out-of-order packet - buffering")
+	log.Debug().
+		Uint32("expected", s.recvSeq).
+		Uint32("got", seq).
+		Msg("out-of-order packet - buffering")
 
 	s.outOfOrderPackets[seq] = pkt
 	s.removeFromNACKListLocked(seq)
 	s.updateNACKListLocked(seq)
 
 	if err := s.sendAckLocked(); err != nil {
-		log.WithError(err).Warn("failed to send ACK with NACKs")
+		log.Warn().Err(err).Msg("failed to send ACK with NACKs")
 	}
 
 	return nil
@@ -2743,10 +2773,10 @@ func (s *StreamConn) handleDataLocked(pkt *Packet) error {
 
 	// Case 2: Duplicate or old packet - ignore
 	if seqLessThan(seq, s.recvSeq) {
-		log.WithFields(map[string]interface{}{
-			"expected": s.recvSeq,
-			"got":      seq,
-		}).Debug("duplicate or old packet - ignoring")
+		log.Debug().
+			Uint32("expected", s.recvSeq).
+			Uint32("got", seq).
+			Msg("duplicate or old packet - ignoring")
 		return nil
 	}
 
@@ -2768,15 +2798,18 @@ func (s *StreamConn) deliverBufferedPacketsLocked() {
 		// Deliver this packet
 		n, err := s.recvBuf.Write(pkt.Payload)
 		if err != nil {
-			log.WithError(err).WithField("seq", s.recvSeq).Error("receive buffer full while delivering buffered packet")
+			log.Error().
+				Err(err).
+				Uint32("seq", s.recvSeq).
+				Msg("receive buffer full while delivering buffered packet")
 			// Can't deliver more packets now
 			break
 		}
 
-		log.WithFields(map[string]interface{}{
-			"bytes": n,
-			"seq":   s.recvSeq,
-		}).Debug("delivered buffered packet")
+		log.Debug().
+			Int("bytes", n).
+			Uint32("seq", s.recvSeq).
+			Msg("delivered buffered packet")
 
 		// Update state
 		s.recvSeq++
@@ -2817,12 +2850,12 @@ func (s *StreamConn) calculateSequenceGapLocked(receivedSeq uint32) uint32 {
 
 	maxIterations := uint32(MaxNACKs)
 	if gap > maxIterations {
-		log.WithFields(map[string]interface{}{
-			"recvSeq":       s.recvSeq,
-			"receivedSeq":   receivedSeq,
-			"gap":           gap,
-			"maxIterations": maxIterations,
-		}).Debug("large sequence gap detected, limiting NACK iteration")
+		log.Debug().
+			Uint32("recvSeq", s.recvSeq).
+			Uint32("receivedSeq", receivedSeq).
+			Uint32("gap", gap).
+			Uint32("maxIterations", maxIterations).
+			Msg("large sequence gap detected, limiting NACK iteration")
 		return maxIterations
 	}
 
@@ -2837,19 +2870,19 @@ func (s *StreamConn) addMissingSequencesToNACKListLocked(gap uint32) {
 		seq := s.recvSeq + i
 
 		if len(s.nackList) >= MaxNACKs {
-			log.WithFields(map[string]interface{}{
-				"nackCount":  len(s.nackList),
-				"droppedSeq": seq,
-			}).Debug("NACK list at capacity, dropping new entry")
+			log.Debug().
+				Int("nackCount", len(s.nackList)).
+				Uint32("droppedSeq", seq).
+				Msg("NACK list at capacity, dropping new entry")
 			break
 		}
 
 		if s.shouldAddToNACKListLocked(seq) {
 			s.nackList[seq] = struct{}{}
-			log.WithFields(map[string]interface{}{
-				"seq":       seq,
-				"nackCount": len(s.nackList),
-			}).Debug("added to NACK list")
+			log.Debug().
+				Uint32("seq", seq).
+				Int("nackCount", len(s.nackList)).
+				Msg("added to NACK list")
 		}
 	}
 }
@@ -2874,10 +2907,10 @@ func (s *StreamConn) shouldAddToNACKListLocked(seq uint32) bool {
 func (s *StreamConn) removeFromNACKListLocked(seq uint32) {
 	if _, exists := s.nackList[seq]; exists {
 		delete(s.nackList, seq)
-		log.WithFields(map[string]interface{}{
-			"seq":       seq,
-			"remaining": len(s.nackList),
-		}).Debug("removed from NACK list")
+		log.Debug().
+			Uint32("seq", seq).
+			Int("remaining", len(s.nackList)).
+			Msg("removed from NACK list")
 	}
 }
 
@@ -2948,13 +2981,13 @@ func (s *StreamConn) cleanupAckedPacketsLocked(oldAck, newAck uint32, currentNAC
 	}
 
 	if cleaned > 0 || nackCountsCleaned > 0 {
-		log.WithFields(map[string]interface{}{
-			"oldAck":            oldAck,
-			"newAck":            newAck,
-			"cleaned":           cleaned,
-			"nackCountsCleaned": nackCountsCleaned,
-			"remaining":         len(s.sentPackets),
-		}).Debug("cleaned up ACKed packets")
+		log.Debug().
+			Uint32("oldAck", oldAck).
+			Uint32("newAck", newAck).
+			Int("cleaned", cleaned).
+			Int("nackCountsCleaned", nackCountsCleaned).
+			Int("remaining", len(s.sentPackets)).
+			Msg("cleaned up ACKed packets")
 
 		// Wake any blocked writers now that window space is available
 		if s.sendCond != nil {
@@ -2970,7 +3003,7 @@ func (s *StreamConn) retransmitPacketLocked(seq uint32) error {
 	info, exists := s.sentPackets[seq]
 	if !exists {
 		// Packet was already ACKed and cleaned up, nothing to retransmit
-		log.WithField("seq", seq).Debug("packet already ACKed, skipping retransmit")
+		log.Debug().Uint32("seq", seq).Msg("packet already ACKed, skipping retransmit")
 		return nil
 	}
 
@@ -2986,10 +3019,10 @@ func (s *StreamConn) retransmitPacketLocked(seq uint32) error {
 	info.retryCount++
 	info.sentTime = time.Now()
 
-	log.WithFields(map[string]interface{}{
-		"seq":        seq,
-		"retryCount": info.retryCount,
-	}).Debug("retransmitted packet")
+	log.Debug().
+		Uint32("seq", seq).
+		Int("retryCount", info.retryCount).
+		Msg("retransmitted packet")
 
 	return nil
 }
@@ -3001,12 +3034,12 @@ func (s *StreamConn) retransmitPacketLocked(seq uint32) error {
 //
 //	I2CP OnMessage -> StreamManager.handleIncomingMessage -> StreamManager.dispatchPacket -> here
 func (s *StreamConn) handleIncomingPacket(pkt *Packet) error {
-	log.WithFields(map[string]interface{}{
-		"seq":     pkt.SequenceNum,
-		"ack":     pkt.AckThrough,
-		"flags":   pkt.Flags,
-		"payload": len(pkt.Payload),
-	}).Debug("queuing packet for receiveLoop")
+	log.Debug().
+		Uint32("seq", pkt.SequenceNum).
+		Uint32("ack", pkt.AckThrough).
+		Uint16("flags", pkt.Flags).
+		Int("payload", len(pkt.Payload)).
+		Msg("queuing packet for receiveLoop")
 
 	// Queue packet for receiveLoop to process
 	select {
@@ -3039,7 +3072,9 @@ func (s *StreamConn) sendAckLocked() error {
 	if len(s.nackList) > 0 {
 		pkt.NACKs = s.getNACKListSliceLocked(MaxNACKs)
 
-		log.WithField("nackCount", len(pkt.NACKs)).Debug("including NACKs in ACK packet")
+		log.Debug().
+			Int("nackCount", len(pkt.NACKs)).
+			Msg("including NACKs in ACK packet")
 	}
 
 	return s.sendPacketLocked(pkt)
@@ -3066,7 +3101,9 @@ func (s *StreamConn) sendChokeSignalLocked() error {
 
 	s.sendingChoke = true
 
-	log.WithField("bufferUsage", float64(s.recvBuf.TotalWritten())/float64(s.recvBuf.Size())).Debug("sending choke signal to peer")
+	log.Debug().
+		Float64("bufferUsage", float64(s.recvBuf.TotalWritten())/float64(s.recvBuf.Size())).
+		Msg("sending choke signal to peer")
 
 	return s.sendPacketLocked(pkt)
 }
@@ -3091,7 +3128,9 @@ func (s *StreamConn) sendUnchokeSignalLocked() error {
 
 	s.sendingChoke = false
 
-	log.WithField("bufferUsage", float64(s.recvBuf.TotalWritten())/float64(s.recvBuf.Size())).Debug("sending unchoke signal to peer")
+	log.Debug().
+		Float64("bufferUsage", float64(s.recvBuf.TotalWritten())/float64(s.recvBuf.Size())).
+		Msg("sending unchoke signal to peer")
 
 	return s.sendPacketLocked(pkt)
 }
@@ -3131,10 +3170,10 @@ func (s *StreamConn) trackPacketForRetransmission(pkt *Packet, data []byte) {
 		sentTime:   time.Now(),
 		retryCount: 0,
 	}
-	log.WithFields(map[string]interface{}{
-		"seq":     pkt.SequenceNum,
-		"tracked": len(s.sentPackets),
-	}).Debug("tracking sent packet for retransmission")
+	log.Debug().
+		Uint32("seq", pkt.SequenceNum).
+		Int("tracked", len(s.sentPackets)).
+		Msg("tracking sent packet for retransmission")
 }
 
 // sendViaI2CP sends marshaled packet data via the I2CP session.
@@ -3173,12 +3212,12 @@ func (s *StreamConn) sendViaI2CPWithTracking(data []byte, seqNum uint32, isDataP
 
 // logSentPacket logs debug information about a sent packet.
 func (s *StreamConn) logSentPacket(pkt *Packet) {
-	log.WithFields(map[string]interface{}{
-		"seq":     pkt.SequenceNum,
-		"ack":     pkt.AckThrough,
-		"flags":   pkt.Flags,
-		"payload": len(pkt.Payload),
-	}).Debug("sent packet")
+	log.Debug().
+		Uint32("seq", pkt.SequenceNum).
+		Uint32("ack", pkt.AckThrough).
+		Uint16("flags", pkt.Flags).
+		Int("payload", len(pkt.Payload)).
+		Msg("sent packet")
 }
 
 // getNegotiatedMTULocked returns the negotiated MTU.
@@ -3222,7 +3261,7 @@ func (s *StreamConn) sendCloseIfEstablished() {
 	}
 
 	if err := s.sendCloseLocked(); err != nil {
-		log.WithError(err).Warn("failed to send CLOSE packet")
+		log.Warn().Err(err).Msg("failed to send CLOSE packet")
 	}
 	s.setState(StateClosing)
 }
@@ -3287,10 +3326,10 @@ func (s *StreamConn) sendCloseLocked() error {
 		// Sign the CLOSE packet
 		keyPair, err := s.session.SigningKeyPair()
 		if err != nil {
-			log.WithError(err).Warn("failed to get signing key pair for CLOSE packet")
+			log.Warn().Err(err).Msg("failed to get signing key pair for CLOSE packet")
 			// Continue anyway - signing is best effort for CLOSE
 		} else if err := SignPacket(pkt, keyPair); err != nil {
-			log.WithError(err).Warn("failed to sign CLOSE packet")
+			log.Warn().Err(err).Msg("failed to sign CLOSE packet")
 			// Continue anyway - signing is best effort for CLOSE
 		}
 	}
@@ -3308,7 +3347,9 @@ func (s *StreamConn) handleMessageDelivered(seqNum uint32) {
 	if s.sentPackets != nil {
 		if _, exists := s.sentPackets[seqNum]; exists {
 			delete(s.sentPackets, seqNum)
-			log.WithField("seq", seqNum).Debug("message confirmed delivered by I2CP")
+			log.Debug().
+				Uint32("seq", seqNum).
+				Msg("message confirmed delivered by I2CP")
 		}
 	}
 
@@ -3327,10 +3368,10 @@ func (s *StreamConn) handleMessageFailed(seqNum uint32, retriable bool) {
 		return
 	}
 
-	log.WithFields(map[string]interface{}{
-		"seq":       seqNum,
-		"retriable": retriable,
-	}).Warn("message delivery failed at I2CP layer")
+	log.Warn().
+		Uint32("seq", seqNum).
+		Bool("retriable", retriable).
+		Msg("message delivery failed at I2CP layer")
 
 	if !retriable {
 		// Non-retriable failure - connection may be broken
@@ -3343,20 +3384,20 @@ func (s *StreamConn) handleMessageFailed(seqNum uint32, retriable bool) {
 		if pktInfo, exists := s.sentPackets[seqNum]; exists {
 			pktInfo.retryCount++
 			if pktInfo.retryCount <= MaxRetransmissions {
-				log.WithFields(map[string]interface{}{
-					"seq":        seqNum,
-					"retryCount": pktInfo.retryCount,
-				}).Info("retransmitting packet after I2CP failure")
+				log.Info().
+					Uint32("seq", seqNum).
+					Int("retryCount", pktInfo.retryCount).
+					Msg("retransmitting packet after I2CP failure")
 
 				// Re-send the stored packet data
 				if err := s.sendViaI2CP(pktInfo.data); err != nil {
-					log.WithError(err).WithField("seq", seqNum).Warn("retransmission failed")
+					log.Warn().Err(err).Uint32("seq", seqNum).Msg("retransmission failed")
 				}
 			} else {
-				log.WithFields(map[string]interface{}{
-					"seq":        seqNum,
-					"retryCount": pktInfo.retryCount,
-				}).Warn("max retransmissions exceeded for I2CP failure")
+				log.Warn().
+					Uint32("seq", seqNum).
+					Int("retryCount", pktInfo.retryCount).
+					Msg("max retransmissions exceeded for I2CP failure")
 			}
 		}
 	}

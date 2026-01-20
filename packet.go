@@ -315,6 +315,7 @@ func (p *Packet) marshalOfflineSignature(buf []byte) ([]byte, error) {
 // calculateOptionSizes computes all size components needed for marshaling optional fields.
 // It returns the from destination bytes, signature length, offline signature size, and total option size.
 func (p *Packet) calculateOptionSizes() (fromBytes []byte, sigLen, offlineSigSize int, optionSize uint16, err error) {
+	log.Debug("calculating option sizes")
 	fromBytes, err = p.calculateFromDestinationSize()
 	if err != nil {
 		return nil, 0, 0, 0, err
@@ -329,6 +330,12 @@ func (p *Packet) calculateOptionSizes() (fromBytes []byte, sigLen, offlineSigSiz
 	}
 
 	optionSize = p.calculateTotalOptionSize(len(fromBytes), sigLen, offlineSigSize)
+	log.WithFields(map[string]interface{}{
+		"fromBytesLen":   len(fromBytes),
+		"sigLen":         sigLen,
+		"offlineSigSize": offlineSigSize,
+		"optionSize":     optionSize,
+	}).Debug("option sizes calculated")
 	return fromBytes, sigLen, offlineSigSize, optionSize, nil
 }
 
@@ -381,8 +388,17 @@ func (p *Packet) marshalPacketBody(buf, fromBytes []byte, sigLen int, optionSize
 
 // Marshal serializes the Packet into bytes per I2P streaming protocol format.
 func (p *Packet) Marshal() ([]byte, error) {
+	log.WithFields(map[string]interface{}{
+		"sendStreamID": p.SendStreamID,
+		"recvStreamID": p.RecvStreamID,
+		"seqNum":       p.SequenceNum,
+		"flags":        p.Flags,
+		"payloadLen":   len(p.Payload),
+	}).Debug("marshaling packet")
+
 	fromBytes, sigLen, _, optionSize, err := p.calculateOptionSizes()
 	if err != nil {
+		log.WithError(err).Debug("failed to calculate option sizes")
 		return nil, err
 	}
 
@@ -391,11 +407,13 @@ func (p *Packet) Marshal() ([]byte, error) {
 
 	buf, err = p.marshalPacketBody(buf, fromBytes, sigLen, optionSize)
 	if err != nil {
+		log.WithError(err).Debug("failed to marshal packet body")
 		return nil, err
 	}
 
 	buf = append(buf, p.Payload...)
 
+	log.WithField("totalBytes", len(buf)).Debug("packet marshaled")
 	return buf, nil
 }
 
@@ -491,12 +509,15 @@ func (p *Packet) unmarshalFromDestination(data []byte, offset, optionsEnd int) (
 		return offset, nil
 	}
 	if offset >= optionsEnd {
+		log.Debug("option data too short for FROM destination")
 		return offset, fmt.Errorf("option data too short for FROM destination")
 	}
 
+	log.Debug("parsing FROM destination")
 	stream := go_i2cp.NewStream(data[offset:optionsEnd])
 	dest, err := go_i2cp.NewDestinationFromMessage(stream, nil)
 	if err != nil {
+		log.WithError(err).Debug("failed to unmarshal FROM destination")
 		return offset, fmt.Errorf("unmarshal FROM destination: %w", err)
 	}
 	p.FromDestination = dest
@@ -653,16 +674,21 @@ func (p *Packet) unmarshalOptions(data []byte, offset, optionsEnd int) error {
 
 // Unmarshal parses bytes into a Packet per I2P streaming protocol format.
 func (p *Packet) Unmarshal(data []byte) error {
+	log.WithField("dataLen", len(data)).Debug("unmarshaling packet")
+
 	if len(data) < 22 {
+		log.WithField("dataLen", len(data)).Debug("packet too short")
 		return fmt.Errorf("packet too short: got %d bytes, need at least 22", len(data))
 	}
 
 	offset, optionsEnd, err := p.unmarshalHeader(data)
 	if err != nil {
+		log.WithError(err).Debug("failed to unmarshal header")
 		return err
 	}
 
 	if err := p.unmarshalOptions(data, offset, optionsEnd); err != nil {
+		log.WithError(err).Debug("failed to unmarshal options")
 		return err
 	}
 
@@ -670,6 +696,13 @@ func (p *Packet) Unmarshal(data []byte) error {
 		p.Payload = data[optionsEnd:]
 	}
 
+	log.WithFields(map[string]interface{}{
+		"sendStreamID": p.SendStreamID,
+		"recvStreamID": p.RecvStreamID,
+		"seqNum":       p.SequenceNum,
+		"flags":        p.Flags,
+		"payloadLen":   len(p.Payload),
+	}).Debug("packet unmarshaled")
 	return nil
 }
 
@@ -679,12 +712,16 @@ func (p *Packet) Unmarshal(data []byte) error {
 //
 // Returns a cryptographically random 32-bit value.
 func generateISN() (uint32, error) {
+	log.Debug("generating initial sequence number")
 	var isn [4]byte
 	_, err := rand.Read(isn[:])
 	if err != nil {
+		log.WithError(err).Debug("failed to generate random ISN")
 		return 0, fmt.Errorf("generate random ISN: %w", err)
 	}
-	return binary.BigEndian.Uint32(isn[:]), nil
+	isn32 := binary.BigEndian.Uint32(isn[:])
+	log.WithField("isn", isn32).Debug("ISN generated")
+	return isn32, nil
 }
 
 // generateStreamID generates a random stream ID for connection identification.
@@ -695,15 +732,18 @@ func generateISN() (uint32, error) {
 //
 // Returns a random uint32 > 0.
 func generateStreamID() (uint32, error) {
+	log.Debug("generating stream ID")
 	// Loop until we get a non-zero value
 	// Expected iterations: ~1 (probability of 0 is 1/2^32)
 	for {
 		var buf [4]byte
 		if _, err := rand.Read(buf[:]); err != nil {
+			log.WithError(err).Debug("failed to generate random stream ID")
 			return 0, fmt.Errorf("generate random stream ID: %w", err)
 		}
 		id := binary.BigEndian.Uint32(buf[:])
 		if id > 0 {
+			log.WithField("streamID", id).Debug("stream ID generated")
 			return id, nil
 		}
 	}

@@ -136,25 +136,31 @@ func (cl *connectionLimiter) CheckAndRecordConnection(peerDest *go_i2cp.Destinat
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
 
+	log.WithField("activeStreams", cl.activeStreams).Debug("checking connection limits")
+
 	now := time.Now()
 
 	// Check concurrent streams limit
 	if err := cl.checkConcurrentLimitLocked(); err != nil {
+		log.WithError(err).Debug("concurrent streams limit exceeded")
 		return err
 	}
 
 	// Check total rate limits
 	if err := cl.checkTotalRateLimitsLocked(now); err != nil {
+		log.WithError(err).Debug("total rate limit exceeded")
 		return err
 	}
 
 	// Check per-peer rate limits
 	if err := cl.checkPeerRateLimitsLocked(peerDest, now); err != nil {
+		log.WithError(err).Debug("per-peer rate limit exceeded")
 		return err
 	}
 
 	// All checks passed - record the connection
 	cl.recordConnectionLocked(peerDest, now)
+	log.WithField("activeStreams", cl.activeStreams).Debug("connection recorded")
 	return nil
 }
 
@@ -162,6 +168,10 @@ func (cl *connectionLimiter) CheckAndRecordConnection(peerDest *go_i2cp.Destinat
 // Must be called with cl.mu held.
 func (cl *connectionLimiter) checkConcurrentLimitLocked() error {
 	if cl.config.MaxConcurrentStreams > 0 && cl.activeStreams >= cl.config.MaxConcurrentStreams {
+		log.WithFields(map[string]interface{}{
+			"active": cl.activeStreams,
+			"max":    cl.config.MaxConcurrentStreams,
+		}).Debug("concurrent streams limit check failed")
 		return fmt.Errorf("max concurrent streams limit exceeded (%d)", cl.config.MaxConcurrentStreams)
 	}
 	return nil
@@ -267,6 +277,7 @@ func (cl *connectionLimiter) ConnectionClosed() {
 	defer cl.mu.Unlock()
 	if cl.activeStreams > 0 {
 		cl.activeStreams--
+		log.WithField("activeStreams", cl.activeStreams).Debug("connection closed, decremented active streams")
 	}
 }
 
@@ -335,10 +346,10 @@ func logLimitExceeded(config *ConnectionLimitsConfig, peerDest *go_i2cp.Destinat
 		}
 	}
 
-	log.Warn().
-		Str("peer", peerID).
-		Str("reason", reason).
-		Msg("incoming connection rejected due to rate limit")
+	log.WithFields(map[string]interface{}{
+		"peer":   peerID,
+		"reason": reason,
+	}).Warn("incoming connection rejected due to rate limit")
 }
 
 // CleanupStaleHistory removes old peer history entries that haven't had activity in 24+ hours.
@@ -347,8 +358,11 @@ func (cl *connectionLimiter) CleanupStaleHistory() {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
 
+	log.WithField("peerCount", len(cl.peerHistory)).Debug("cleaning up stale connection history")
+
 	now := time.Now()
 	cutoff := now.Add(-24 * time.Hour)
+	removedCount := 0
 
 	for peerHash, history := range cl.peerHistory {
 		history.mu.Lock()
@@ -357,6 +371,7 @@ func (cl *connectionLimiter) CleanupStaleHistory() {
 		if len(history.timestamps) == 0 {
 			history.mu.Unlock()
 			delete(cl.peerHistory, peerHash)
+			removedCount++
 			continue
 		}
 
@@ -372,6 +387,12 @@ func (cl *connectionLimiter) CleanupStaleHistory() {
 
 		if !hasRecent {
 			delete(cl.peerHistory, peerHash)
+			removedCount++
 		}
 	}
+
+	log.WithFields(map[string]interface{}{
+		"removed":   removedCount,
+		"remaining": len(cl.peerHistory),
+	}).Debug("stale history cleanup complete")
 }
