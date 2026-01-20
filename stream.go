@@ -202,11 +202,13 @@ type StreamConn struct {
 
 	// Choking mechanism per I2P streaming spec
 	// optDelay field: 0-60000ms = advisory delay, >60000 = choked
-	optDelay        uint16    // Optional delay field from last packet
-	choked          bool      // Are we being choked by remote peer (sender-side)?
-	chokedUntil     time.Time // When to resume sending after being choked
-	sendingChoke    bool      // Are we sending choke signals to remote peer (receiver-side)?
-	lastBufferCheck int64     // Last time we checked buffer usage (TotalWritten value)
+	optDelay        uint16        // Optional delay field from last packet
+	choked          bool          // Are we being choked by remote peer (sender-side)?
+	chokedUntil     time.Time     // When to resume sending after being choked
+	persistTimer    *time.Timer   // Persist timer for sending probe packets while choked
+	persistStopChan chan struct{} // Channel to stop persist timer goroutine
+	sendingChoke    bool          // Are we sending choke signals to remote peer (receiver-side)?
+	lastBufferCheck int64         // Last time we checked buffer usage (TotalWritten value)
 
 	// MTU negotiation
 	localMTU  uint16 // Our advertised MTU
@@ -315,6 +317,12 @@ const (
 	// FastRetransmitThreshold is the number of NACKs required before fast retransmit.
 	// Per I2P streaming spec: "Two NACKs of a packet is a request for a 'fast retransmit'"
 	FastRetransmitThreshold = 2
+
+	// PersistProbeInterval is the interval between probe packets when choked.
+	// Per I2P streaming spec: "The choked endpoint should start a 'persist timer'
+	// to control the probing" to compensate for possible lost unchoke packets.
+	// Using 5 seconds as a reasonable interval (less than typical chokedUntil but often enough).
+	PersistProbeInterval = 5 * time.Second
 )
 
 // Dial initiates a connection to the specified I2P destination.
@@ -2306,7 +2314,126 @@ func (s *StreamConn) reduceCongestionWindowLocked() {
 		Msg("congestion detected: reduced window due to packet loss")
 }
 
+// startPersistTimerLocked starts the persist timer for sending probe packets while choked.
+// Per I2P streaming spec: "The choked endpoint should start a 'persist timer' to control
+// the probing" to compensate for possible lost unchoke packets.
+// Must be called with s.mu held.
+func (s *StreamConn) startPersistTimerLocked() {
+	// Don't start if already running or no session
+	if s.persistTimer != nil || s.session == nil {
+		return
+	}
+
+	s.persistStopChan = make(chan struct{})
+	stopChan := s.persistStopChan
+
+	// Create timer that fires periodically
+	s.persistTimer = time.NewTimer(PersistProbeInterval)
+
+	log.Debug().
+		Dur("interval", PersistProbeInterval).
+		Msg("persist timer started for choke probing")
+
+	// Start goroutine to handle timer events
+	go s.runPersistTimer(stopChan)
+}
+
+// runPersistTimer runs the persist timer loop, sending probe packets periodically.
+// Runs until stopChan is closed or connection is closed.
+func (s *StreamConn) runPersistTimer(stopChan <-chan struct{}) {
+	for {
+		s.mu.Lock()
+		timer := s.persistTimer
+		s.mu.Unlock()
+
+		if timer == nil {
+			return
+		}
+
+		select {
+		case <-stopChan:
+			return
+		case <-timer.C:
+			s.mu.Lock()
+			// Check if still choked and timer is still active
+			if !s.choked || s.closed || s.persistTimer == nil {
+				s.mu.Unlock()
+				return
+			}
+
+			// Send probe packet
+			s.sendProbePacketLocked()
+
+			// Reset timer for next probe
+			if s.persistTimer != nil {
+				s.persistTimer.Reset(PersistProbeInterval)
+			}
+			s.mu.Unlock()
+		}
+	}
+}
+
+// stopPersistTimerLocked stops the persist timer.
+// Must be called with s.mu held.
+func (s *StreamConn) stopPersistTimerLocked() {
+	if s.persistTimer != nil {
+		s.persistTimer.Stop()
+		s.persistTimer = nil
+		log.Debug().Msg("persist timer stopped")
+	}
+	if s.persistStopChan != nil {
+		close(s.persistStopChan)
+		s.persistStopChan = nil
+	}
+}
+
+// sendProbePacketLocked sends a small probe packet while choked.
+// Per I2P streaming spec: "occasional 'probe' data packets to compensate for
+// possible lost unchoke packets."
+// The probe is a minimal data packet (1 byte) to elicit an ACK/unchoke from the peer.
+// Must be called with s.mu held.
+func (s *StreamConn) sendProbePacketLocked() {
+	if s.session == nil || s.closed {
+		return
+	}
+
+	// Build a minimal probe packet with 1 byte of data
+	// This is just enough to trigger an ACK response from the peer
+	pkt := &Packet{
+		SendStreamID: s.remoteStreamID,
+		RecvStreamID: s.localStreamID,
+		SequenceNum:  s.sendSeq,
+		AckThrough:   s.recvSeq - 1,
+		Payload:      []byte{0}, // Minimal probe payload
+	}
+
+	// Marshal and send
+	data, err := pkt.Marshal()
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to marshal probe packet")
+		return
+	}
+
+	// Per TCP persist timer semantics, we DO increment sequence
+	// so the peer can ACK it properly
+	s.sendSeq++
+
+	// Send probe packet using I2CP
+	stream := go_i2cp.NewStream(data)
+	err = s.session.SendMessage(s.dest, 6, s.localPort, s.remotePort, stream, 0)
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to send probe packet")
+		return
+	}
+
+	log.Debug().
+		Uint32("seq", pkt.SequenceNum).
+		Msg("sent probe packet while choked")
+}
+
 // handleOptionalDelayLocked processes the choke/unchoke mechanism.
+// Starts a persist timer when choked to send periodic probe packets,
+// compensating for possible lost unchoke packets per I2P streaming spec.
 // Must be called with s.mu held.
 func (s *StreamConn) handleOptionalDelayLocked(pkt *Packet) {
 	if pkt.Flags&FlagDelayRequested == 0 {
@@ -2314,19 +2441,31 @@ func (s *StreamConn) handleOptionalDelayLocked(pkt *Packet) {
 	}
 
 	if pkt.OptionalDelay > 60000 {
+		wasChoked := s.choked
 		s.choked = true
 		s.chokedUntil = time.Now().Add(time.Second)
 		log.Debug().
 			Uint16("delay", pkt.OptionalDelay).
 			Time("chokedUntil", s.chokedUntil).
 			Msg("peer is choked - pausing transmission")
+
+		// Start persist timer if not already running
+		if !wasChoked {
+			s.startPersistTimerLocked()
+		}
 	} else {
 		wasChoked := s.choked
 		s.choked = false
 		s.chokedUntil = time.Time{}
-		if wasChoked && s.sendCond != nil {
-			s.sendCond.Broadcast()
+
+		// Stop persist timer when unchoked
+		if wasChoked {
+			s.stopPersistTimerLocked()
+			if s.sendCond != nil {
+				s.sendCond.Broadcast()
+			}
 		}
+
 		if pkt.OptionalDelay > 0 {
 			log.Debug().
 				Uint16("delay", pkt.OptionalDelay).
@@ -2963,6 +3102,9 @@ func (s *StreamConn) cleanupConnectionLocked() {
 	if s.manager != nil {
 		s.manager.UnregisterConnection(s.localPort, s.remotePort)
 	}
+
+	// Stop persist timer if running
+	s.stopPersistTimerLocked()
 
 	s.cancel()
 	s.closed = true
