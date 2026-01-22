@@ -108,6 +108,78 @@ func NewStreamManager(client *go_i2cp.Client) (*StreamManager, error) {
 		return nil, fmt.Errorf("client cannot be nil")
 	}
 
+	sm := newStreamManagerBase(client)
+
+	// Create I2CP session with callbacks
+	callbacks := sm.GetSessionCallbacks()
+	sm.session = go_i2cp.NewSession(client, callbacks)
+
+	// Start packet processor
+	sm.processorWg.Add(1)
+	go sm.processPackets()
+
+	return sm, nil
+}
+
+// NewStreamManagerFromSession creates a stream manager that wraps an existing I2CP session.
+// This is useful when integrating with systems that manage their own I2CP sessions,
+// such as SAM bridge implementations.
+//
+// IMPORTANT: The session must have been created with callbacks that forward to this
+// StreamManager. Use GetSessionCallbacksForManager() to get the appropriate callbacks
+// before creating the session, or ensure your callbacks invoke the StreamManager's
+// handler methods.
+//
+// Example usage with pre-created session:
+//
+//	// Create manager first (without session)
+//	sm := streaming.NewStreamManagerBase(client)
+//
+//	// Get callbacks that forward to the manager
+//	callbacks := sm.GetSessionCallbacks()
+//
+//	// Create session with those callbacks
+//	session := go_i2cp.NewSession(client, callbacks)
+//
+//	// Attach the session to the manager
+//	sm.SetSession(session)
+//
+// Or use the convenience constructor:
+//
+//	// If session was created with compatible callbacks
+//	sm, err := streaming.NewStreamManagerFromSession(client, existingSession)
+//
+// Note: When using an existing session, StartSession() should NOT be called
+// as the session is assumed to already be initialized. The manager will
+// immediately mark itself as ready.
+func NewStreamManagerFromSession(client *go_i2cp.Client, session *go_i2cp.Session) (*StreamManager, error) {
+	if client == nil {
+		return nil, fmt.Errorf("client cannot be nil")
+	}
+	if session == nil {
+		return nil, fmt.Errorf("session cannot be nil")
+	}
+
+	sm := newStreamManagerBase(client)
+	sm.session = session
+
+	// Mark session as ready since we're using an existing session
+	select {
+	case sm.sessionReady <- struct{}{}:
+	default:
+	}
+
+	// Start packet processor
+	sm.processorWg.Add(1)
+	go sm.processPackets()
+
+	return sm, nil
+}
+
+// newStreamManagerBase creates a StreamManager with all fields initialized
+// except for the session. This is used internally by both NewStreamManager
+// and NewStreamManagerFromSession.
+func newStreamManagerBase(client *go_i2cp.Client) *StreamManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	sm := &StreamManager{
@@ -137,22 +209,63 @@ func NewStreamManager(client *go_i2cp.Client) (*StreamManager, error) {
 	// Initialize profile config with default (bulk)
 	sm.profileConfig = DefaultProfileConfig()
 
-	// Create I2CP session with callbacks
-	callbacks := go_i2cp.SessionCallbacks{
+	return sm
+}
+
+// GetSessionCallbacks returns the SessionCallbacks that should be used when
+// creating an I2CP session that will be used with this StreamManager.
+//
+// This is useful for SAM bridge integration or other scenarios where the
+// session needs to be created externally but must route messages through
+// the StreamManager.
+//
+// Example:
+//
+//	sm := streaming.NewStreamManagerBase(client)
+//	callbacks := sm.GetSessionCallbacks()
+//	// Optionally wrap or extend callbacks here
+//	session := go_i2cp.NewSession(client, callbacks)
+//	sm.SetSession(session)
+func (sm *StreamManager) GetSessionCallbacks() go_i2cp.SessionCallbacks {
+	return go_i2cp.SessionCallbacks{
 		OnMessage:       sm.handleIncomingMessage,
 		OnStatus:        sm.handleSessionStatus,
 		OnDestination:   sm.handleDestinationResult,
 		OnMessageStatus: sm.handleMessageStatus,
 		OnLeaseSet2:     sm.handleLeaseSet2,
 	}
+}
 
-	sm.session = go_i2cp.NewSession(client, callbacks)
+// SetSession sets the I2CP session for this StreamManager.
+// This is used when the session is created externally and needs to be
+// attached to an existing StreamManager.
+//
+// IMPORTANT: The session should have been created with callbacks from
+// GetSessionCallbacks() to ensure proper message routing.
+//
+// If the packet processor is not already running, this method starts it.
+// After calling SetSession, do NOT call StartSession().
+func (sm *StreamManager) SetSession(session *go_i2cp.Session) error {
+	if session == nil {
+		return fmt.Errorf("session cannot be nil")
+	}
 
-	// Start packet processor
-	sm.processorWg.Add(1)
-	go sm.processPackets()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	return sm, nil
+	if sm.closed {
+		return fmt.Errorf("stream manager is closed")
+	}
+
+	sm.session = session
+
+	// Mark session as ready since we're using an existing session
+	select {
+	case sm.sessionReady <- struct{}{}:
+	default:
+	}
+
+	return nil
 }
 
 // StartSession initializes the I2CP session and waits for it to be ready.

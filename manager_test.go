@@ -444,3 +444,191 @@ func TestStreamManager_DispatchPacket_RESETOnUnknownConnection(t *testing.T) {
 	// If we got here without panic, RESET was handled correctly
 	t.Log("dispatchPacket correctly handles data packet to unknown connection")
 }
+
+// TestStreamManager_NewStreamManagerFromSession verifies that a StreamManager can be
+// created from an existing I2CP session.
+func TestStreamManager_NewStreamManagerFromSession(t *testing.T) {
+	i2cp := RequireI2CP(t)
+	client := i2cp.Client
+
+	// Create a base manager to get callbacks
+	baseManager := newStreamManagerBase(client)
+	callbacks := baseManager.GetSessionCallbacks()
+
+	// Create a session with those callbacks
+	session := go_i2cp.NewSession(client, callbacks)
+	require.NotNil(t, session)
+
+	// Create a StreamManager from the existing session
+	manager, err := NewStreamManagerFromSession(client, session)
+	require.NoError(t, err)
+	require.NotNil(t, manager)
+	defer manager.Close()
+
+	// Verify the session is set correctly
+	assert.Equal(t, session, manager.Session())
+
+	// Verify session is marked as ready (should not block)
+	select {
+	case <-manager.sessionReady:
+		// Expected - session should be ready
+	default:
+		t.Fatal("session should be marked as ready")
+	}
+}
+
+// TestStreamManager_SetSession verifies that SetSession correctly attaches a session.
+func TestStreamManager_SetSession(t *testing.T) {
+	i2cp := RequireI2CP(t)
+	client := i2cp.Client
+
+	// Create a base manager without a session
+	manager := newStreamManagerBase(client)
+	require.NotNil(t, manager)
+
+	// Get callbacks for proper message routing
+	callbacks := manager.GetSessionCallbacks()
+
+	// Create a session with those callbacks
+	session := go_i2cp.NewSession(client, callbacks)
+	require.NotNil(t, session)
+
+	// Start the packet processor manually (normally done by constructors)
+	manager.processorWg.Add(1)
+	go manager.processPackets()
+	defer manager.Close()
+
+	// Set the session
+	err := manager.SetSession(session)
+	require.NoError(t, err)
+
+	// Verify the session is set correctly
+	assert.Equal(t, session, manager.Session())
+
+	// Verify session is marked as ready
+	select {
+	case <-manager.sessionReady:
+		// Expected - session should be ready
+	default:
+		t.Fatal("session should be marked as ready after SetSession")
+	}
+}
+
+// TestStreamManager_SetSessionNil verifies that SetSession rejects nil session.
+func TestStreamManager_SetSessionNil(t *testing.T) {
+	i2cp := RequireI2CP(t)
+	client := i2cp.Client
+
+	manager := newStreamManagerBase(client)
+	require.NotNil(t, manager)
+
+	err := manager.SetSession(nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "session cannot be nil")
+}
+
+// TestStreamManager_GetSessionCallbacks verifies that GetSessionCallbacks returns valid callbacks.
+func TestStreamManager_GetSessionCallbacks(t *testing.T) {
+	i2cp := RequireI2CP(t)
+	client := i2cp.Client
+
+	manager := newStreamManagerBase(client)
+	require.NotNil(t, manager)
+
+	callbacks := manager.GetSessionCallbacks()
+
+	// Verify all required callbacks are set
+	assert.NotNil(t, callbacks.OnMessage, "OnMessage callback should be set")
+	assert.NotNil(t, callbacks.OnStatus, "OnStatus callback should be set")
+	assert.NotNil(t, callbacks.OnDestination, "OnDestination callback should be set")
+	assert.NotNil(t, callbacks.OnMessageStatus, "OnMessageStatus callback should be set")
+	assert.NotNil(t, callbacks.OnLeaseSet2, "OnLeaseSet2 callback should be set")
+}
+
+// TestStreamManager_FromSessionNilClient verifies error handling for nil client.
+func TestStreamManager_FromSessionNilClient(t *testing.T) {
+	i2cp := RequireI2CP(t)
+	session := i2cp.Manager.Session()
+
+	_, err := NewStreamManagerFromSession(nil, session)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "client cannot be nil")
+}
+
+// TestStreamManager_FromSessionNilSession verifies error handling for nil session.
+func TestStreamManager_FromSessionNilSession(t *testing.T) {
+	i2cp := RequireI2CP(t)
+	client := i2cp.Client
+
+	_, err := NewStreamManagerFromSession(client, nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "session cannot be nil")
+}
+
+// TestStreamManager_FromSessionMessageRouting verifies that messages are routed correctly
+// when using NewStreamManagerFromSession.
+func TestStreamManager_FromSessionMessageRouting(t *testing.T) {
+	i2cp := RequireI2CP(t)
+	client := i2cp.Client
+
+	// Create a base manager and get callbacks
+	manager := newStreamManagerBase(client)
+	callbacks := manager.GetSessionCallbacks()
+
+	// Create session with manager's callbacks
+	session := go_i2cp.NewSession(client, callbacks)
+	manager.session = session
+
+	// Start packet processor
+	manager.processorWg.Add(1)
+	go manager.processPackets()
+	defer manager.Close()
+
+	// Register a test connection
+	const localPort uint16 = 9001
+	const remotePort uint16 = 9002
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	conn := &StreamConn{
+		manager:    manager,
+		session:    session,
+		localPort:  localPort,
+		remotePort: remotePort,
+		recvChan:   make(chan *Packet, 32),
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+
+	manager.RegisterConnection(localPort, remotePort, conn)
+
+	// Create and send a test packet through the callback
+	dataPkt := &Packet{
+		SendStreamID: uint32(remotePort),
+		RecvStreamID: uint32(localPort),
+		SequenceNum:  200,
+		AckThrough:   0,
+		Flags:        0,
+		Payload:      []byte("test from existing session"),
+	}
+
+	data, err := dataPkt.Marshal()
+	require.NoError(t, err)
+
+	// Simulate incoming message through the callback
+	testPayload := go_i2cp.NewStream(data)
+	callbacks.OnMessage(session, nil, 6, remotePort, localPort, testPayload)
+
+	// Give packet processor time to route
+	time.Sleep(10 * time.Millisecond)
+
+	// Verify packet was delivered
+	select {
+	case pkt := <-conn.recvChan:
+		assert.Equal(t, uint32(200), pkt.SequenceNum)
+		assert.Equal(t, []byte("test from existing session"), pkt.Payload)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("packet not delivered to connection")
+	}
+}
