@@ -1,4 +1,4 @@
-Release notes for: `go-streaming` Version `0.1.2-rc1`
+Release notes for: `go-streaming` Version `0.1.2-rc2`
 ==============================================
 
 This file is generated automatically in order to keep git tags in sync.
