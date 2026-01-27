@@ -7,7 +7,7 @@ toolchain go1.24.12
 require (
 	github.com/armon/circbuf v0.0.0-20190214190532-5111143e8da2
 	github.com/go-i2p/common v0.1.0
-	github.com/go-i2p/go-i2cp v0.1.1-0.20260124020217-dc6f6649a1df
+	github.com/go-i2p/go-i2cp v0.1.1-rc1
 	github.com/go-i2p/logger v0.1.0
 	github.com/stretchr/testify v1.11.1
 )
@@ -16,7 +16,7 @@ require (
 	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
-	github.com/go-i2p/crypto v0.1.1-0.20251212210701-124dadb97cb7 // indirect
+	github.com/go-i2p/crypto v0.1.1-rc2 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/samber/lo v1.52.0 // indirect
