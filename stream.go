@@ -149,6 +149,53 @@ func (a *I2PAddr) String() string {
 	return fmt.Sprintf("i2p:%d", a.port)
 }
 
+// Destination returns the underlying I2P destination.
+// Returns nil if no destination is available.
+func (a *I2PAddr) Destination() *go_i2cp.Destination {
+	if a == nil {
+		return nil
+	}
+	return a.dest
+}
+
+// Base64 returns the Base64 representation of the destination.
+// Returns an empty string if no destination is available.
+func (a *I2PAddr) Base64() string {
+	if a == nil || a.dest == nil {
+		return ""
+	}
+	return a.dest.Base64()
+}
+
+// Base32 returns the Base32 representation of the destination.
+// Returns an empty string if no destination is available.
+func (a *I2PAddr) Base32() string {
+	if a == nil || a.dest == nil {
+		return ""
+	}
+	return a.dest.Base32()
+}
+
+// PeerDestination extracts an I2P destination from a net.Addr.
+// Returns false if the address is not an I2PAddr or no destination is available.
+func PeerDestination(addr net.Addr) (*go_i2cp.Destination, bool) {
+	i2pAddr, ok := addr.(*I2PAddr)
+	if !ok || i2pAddr == nil || i2pAddr.dest == nil {
+		return nil, false
+	}
+	return i2pAddr.dest, true
+}
+
+// PeerDestinationBase64 extracts a peer destination Base64 from a net.Addr.
+// Returns false if the address is not an I2PAddr or no destination is available.
+func PeerDestinationBase64(addr net.Addr) (string, bool) {
+	dest, ok := PeerDestination(addr)
+	if !ok {
+		return "", false
+	}
+	return dest.Base64(), true
+}
+
 // sentPacket tracks information about a sent packet for retransmission.
 // Used by sender to handle NACK requests from receiver.
 type sentPacket struct {

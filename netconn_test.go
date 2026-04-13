@@ -45,6 +45,99 @@ func TestI2PAddr_String(t *testing.T) {
 	}
 }
 
+// TestI2PAddr_DestinationAccessors tests destination accessor methods.
+func TestI2PAddr_DestinationAccessors(t *testing.T) {
+	crypto := go_i2cp.NewCrypto()
+	dest, err := go_i2cp.NewDestination(crypto)
+	require.NoError(t, err)
+
+	t.Run("nil receiver", func(t *testing.T) {
+		var addr *I2PAddr
+		assert.Nil(t, addr.Destination())
+		assert.Equal(t, "", addr.Base64())
+		assert.Equal(t, "", addr.Base32())
+	})
+
+	t.Run("nil destination", func(t *testing.T) {
+		addr := &I2PAddr{dest: nil, port: 1234}
+		assert.Nil(t, addr.Destination())
+		assert.Equal(t, "", addr.Base64())
+		assert.Equal(t, "", addr.Base32())
+	})
+
+	t.Run("with destination", func(t *testing.T) {
+		addr := &I2PAddr{dest: dest, port: 1234}
+		assert.Same(t, dest, addr.Destination())
+		assert.Equal(t, dest.Base64(), addr.Base64())
+		assert.Equal(t, dest.Base32(), addr.Base32())
+	})
+}
+
+// TestPeerDestinationHelpers tests extracting peer destination from net.Addr values.
+func TestPeerDestinationHelpers(t *testing.T) {
+	crypto := go_i2cp.NewCrypto()
+	dest, err := go_i2cp.NewDestination(crypto)
+	require.NoError(t, err)
+
+	t.Run("non I2P address", func(t *testing.T) {
+		peerDest, ok := PeerDestination(&net.TCPAddr{Port: 80})
+		assert.False(t, ok)
+		assert.Nil(t, peerDest)
+
+		b64, ok := PeerDestinationBase64(&net.TCPAddr{Port: 80})
+		assert.False(t, ok)
+		assert.Equal(t, "", b64)
+	})
+
+	t.Run("I2P address without destination", func(t *testing.T) {
+		peerDest, ok := PeerDestination(&I2PAddr{dest: nil, port: 1234})
+		assert.False(t, ok)
+		assert.Nil(t, peerDest)
+
+		b64, ok := PeerDestinationBase64(&I2PAddr{dest: nil, port: 1234})
+		assert.False(t, ok)
+		assert.Equal(t, "", b64)
+	})
+
+	t.Run("I2P address with destination", func(t *testing.T) {
+		addr := &I2PAddr{dest: dest, port: 1234}
+
+		peerDest, ok := PeerDestination(addr)
+		assert.True(t, ok)
+		assert.Same(t, dest, peerDest)
+
+		b64, ok := PeerDestinationBase64(addr)
+		assert.True(t, ok)
+		assert.Equal(t, dest.Base64(), b64)
+	})
+}
+
+// TestAcceptConnRemoteAddrPeerDestination verifies accepted inbound connections expose peer destination.
+func TestAcceptConnRemoteAddrPeerDestination(t *testing.T) {
+	crypto := go_i2cp.NewCrypto()
+	peerDest, err := go_i2cp.NewDestination(crypto)
+	require.NoError(t, err)
+
+	listener := &StreamListener{
+		acceptChan: make(chan *StreamConn, 1),
+	}
+	inboundConn := &StreamConn{
+		dest:       peerDest,
+		remotePort: 9999,
+	}
+
+	err = listener.queueConnectionForAccept(inboundConn, inboundConn.remotePort)
+	require.NoError(t, err)
+
+	accepted, err := listener.Accept()
+	require.NoError(t, err)
+	require.NotNil(t, accepted)
+
+	b64, ok := PeerDestinationBase64(accepted.RemoteAddr())
+	assert.True(t, ok)
+	assert.Equal(t, peerDest.Base64(), b64)
+}
+
 // TestI2PAddr_ImplementsNetAddr verifies I2PAddr implements net.Addr
 func TestI2PAddr_ImplementsNetAddr(t *testing.T) {
 	var _ net.Addr = &I2PAddr{}
