@@ -10,8 +10,8 @@ github.com/go-i2p/common v0.1.4-0.20260406221321-5d52c2809acd h1:+NpKesYRiMbb3/T
 github.com/go-i2p/common v0.1.4-0.20260406221321-5d52c2809acd/go.mod h1:DODNE6vLkbSn6c5yey6eAMkdo5oUabWceAX7dVEhgdo=
 github.com/go-i2p/crypto v0.1.4-0.20260327201310-96101c044a62 h1:d6kQAwBKkYe8dCHsbXJn3n6lGjqS8ermfeEj1ZsyRiQ=
 github.com/go-i2p/crypto v0.1.4-0.20260327201310-96101c044a62/go.mod h1:dPXGp189PUFOQDMJD9vGo+yfx4W42+Tu4ecrKns+yi0=
-github.com/go-i2p/go-i2cp v0.1.4-0.20260410222419-eb65cbb4ebaa h1:FDAKjDOwTdgzJrSveX5vFEmbaT2Zhj4HNso6VHejO1I=
-github.com/go-i2p/go-i2cp v0.1.4-0.20260410222419-eb65cbb4ebaa/go.mod h1:lhs8RWqi3Fk3tOz4J76CVuuAfVhog5KPRKbkQQTkoW0=
+github.com/go-i2p/go-i2cp v0.1.4-0.20260416155517-f8c330e19c2b h1:REgvB2W35zTLJM4mBGhe03XiTjCzkyrXPZ7VhhAk4Ok=
+github.com/go-i2p/go-i2cp v0.1.4-0.20260416155517-f8c330e19c2b/go.mod h1:ha/kdYHq8dwqLDXRnmyOeYCgpklyWJO4LIP5sBDI+EI=
 github.com/go-i2p/logger v0.1.5 h1:bqX0R59jRNhCTuOVm97gtvo6tH2+nU1NJ53WzAi3I4I=
 github.com/go-i2p/logger v0.1.5/go.mod h1:fEh2nRZ6HwLJNaWJuE25mCzDa6VpCI4O37u5OfGNvus=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
