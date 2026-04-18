@@ -8,7 +8,7 @@ TEST_FLAGS="${TEST_FLAGS:-}"
 
 # go-i2cp clients read router endpoint from a config file, not I2CP_HOST/I2CP_PORT env vars.
 # Generate a temporary config so tests that call go_i2cp.NewClient() connect to the compose router.
-TMP_I2CP_CONF="$(mktemp /tmp/go-streaming-i2cp-XXXXXX.conf)"
+TMP_I2CP_CONF="$(mktemp /tmp/go-streaming-i2cp.XXXXXX)"
 trap 'rm -f "${TMP_I2CP_CONF}"' EXIT INT TERM
 cat > "${TMP_I2CP_CONF}" <<EOF
 i2cp.tcp.host=${I2CP_HOST};
