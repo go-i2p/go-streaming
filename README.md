@@ -123,6 +123,14 @@ System tests (requires running I2P router):
 go test -tags=system -v -timeout=5m
 ```
 
+Containerized system tests (predictable router + test runner, no host ports):
+
+```bash
+./scripts/container/test-with-router.sh
+```
+
+This runs tests in a `router-tests` container against an `i2p-router` container with no published ports.
+
 ## Documentation
 
 - [SPEC.md](SPEC.md) - I2P streaming protocol specification
