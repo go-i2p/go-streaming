@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1.7
+
+FROM geti2p/i2p:latest
+
+# Install socat for port forwarding
+RUN apt-get update && apt-get install -y socat && rm -rf /var/lib/apt/lists/*
+
+# Wrapper script that starts router and forwards I2CP from 127.0.0.1:7654 to the container network IP.
+RUN cat > /start-for-compose.sh <<'EOF'
+#!/bin/sh
+set -e
+
+echo "[i2p-init] Starting I2P router..."
+
+# Start the router in the background
+/startapp.sh &
+ROUTER_PID=$!
+
+# Wait for router to initialize and create I2CP listener on 127.0.0.1:7654
+echo "[i2p-init] Waiting for router to start (10 seconds)..."
+sleep 10
+
+# Get the container's IP address on the compose network
+CONTAINER_IP=$(hostname -I | awk '{print $1}')
+echo "[i2p-init] Container IP: $CONTAINER_IP"
+
+# Bind only to the container IP so it does not conflict with 127.0.0.1:7654.
+echo "[i2p-init] Setting up port forwarding: ${CONTAINER_IP}:7654 -> 127.0.0.1:7654"
+socat TCP-LISTEN:7654,bind="${CONTAINER_IP}",reuseaddr,fork TCP:127.0.0.1:7654 &
+SOCAT_PID=$!
+
+echo "[i2p-init] I2CP forwarding active (socat PID=$SOCAT_PID)"
+
+# Wait for router to terminate
+wait $ROUTER_PID
+echo "[i2p-init] Router exited, cleaning up socat..."
+kill $SOCAT_PID 2>/dev/null || true
+wait $SOCAT_PID 2>/dev/null || true
+EOF
+RUN chmod +x /start-for-compose.sh
+
+ENTRYPOINT ["/start-for-compose.sh"]
+

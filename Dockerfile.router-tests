@@ -1,0 +1,13 @@
+# syntax=docker/dockerfile:1.7
+
+FROM golang:1.25-alpine
+
+WORKDIR /workspace
+COPY . /workspace
+
+ENV I2CP_HOST=i2p-router
+ENV I2CP_PORT=7654
+
+RUN chmod +x /workspace/scripts/container/run-router-tests.sh
+
+ENTRYPOINT ["/workspace/scripts/container/run-router-tests.sh"]
