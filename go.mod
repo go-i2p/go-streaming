@@ -6,7 +6,7 @@ require (
 	github.com/armon/circbuf v0.0.0-20190214190532-5111143e8da2
 	github.com/go-i2p/common v0.1.51
 	github.com/go-i2p/go-i2cp v0.1.4-0.20260416155517-f8c330e19c2b
-	github.com/go-i2p/logger v0.1.5
+	github.com/go-i2p/logger v0.1.51
 	github.com/stretchr/testify v1.11.1
 )
 
