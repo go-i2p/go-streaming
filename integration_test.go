@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/armon/circbuf"
 	go_i2cp "github.com/go-i2p/go-i2cp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -104,7 +103,7 @@ func TestEndToEnd_PacketRoundTrip(t *testing.T) {
 // This tests our implementation with real I2CP session.
 func TestEndToEnd_StreamConnReadWrite(t *testing.T) {
 	// Create a real StreamConn in established state
-	recvBuf, err := circbuf.NewBuffer(32768)
+	recvBuf, err := NewBuffer(32768)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -221,7 +220,7 @@ func TestEndToEnd_ConnectionMultiplexing(t *testing.T) {
 	// Create 3 connections with different ports
 	connections := make([]*StreamConn, 3)
 	for i := 0; i < 3; i++ {
-		recvBuf, err := circbuf.NewBuffer(32768)
+		recvBuf, err := NewBuffer(32768)
 		require.NoError(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -336,9 +335,9 @@ func TestEndToEnd_LargeDataTransfer(t *testing.T) {
 // TestEndToEnd_BidirectionalCommunication tests simultaneous send/receive.
 func TestEndToEnd_BidirectionalCommunication(t *testing.T) {
 	// Create two StreamConns representing both sides of a connection
-	recvBuf1, err := circbuf.NewBuffer(32768)
+	recvBuf1, err := NewBuffer(32768)
 	require.NoError(t, err)
-	recvBuf2, err := circbuf.NewBuffer(32768)
+	recvBuf2, err := NewBuffer(32768)
 	require.NoError(t, err)
 
 	ctx1, cancel1 := context.WithCancel(context.Background())
@@ -433,7 +432,7 @@ func TestEndToEnd_BidirectionalCommunication(t *testing.T) {
 
 // TestEndToEnd_CloseHandshake tests the bidirectional CLOSE handshake.
 func TestEndToEnd_CloseHandshake(t *testing.T) {
-	recvBuf, err := circbuf.NewBuffer(32768)
+	recvBuf, err := NewBuffer(32768)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -511,7 +510,7 @@ func TestEndToEnd_ConcurrentStressTest(t *testing.T) {
 				port := uint16(10000 + id*100 + j)
 
 				ctx, cancel := context.WithCancel(context.Background())
-				recvBuf, _ := circbuf.NewBuffer(8192)
+				recvBuf, _ := NewBuffer(8192)
 
 				conn := &StreamConn{
 					manager:    manager,
@@ -1204,7 +1203,7 @@ func Benchmark_EndToEnd_ConnectionLookup(b *testing.B) {
 	for i := 0; i < 100; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		recvBuf, _ := circbuf.NewBuffer(8192)
+		recvBuf, _ := NewBuffer(8192)
 
 		port := uint16(10000 + i)
 		conn := &StreamConn{

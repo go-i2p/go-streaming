@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/armon/circbuf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -170,7 +169,7 @@ func TestConnStateTransitions(t *testing.T) {
 	isn, err := generateISN()
 	require.NoError(t, err)
 
-	recvBuf, err := circbuf.NewBuffer(1024)
+	recvBuf, err := NewBuffer(1024)
 	require.NoError(t, err)
 
 	conn := &StreamConn{
@@ -241,7 +240,7 @@ func TestGetNegotiatedMTU(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			recvBuf, err := circbuf.NewBuffer(1024)
+			recvBuf, err := NewBuffer(1024)
 			require.NoError(t, err)
 
 			conn := &StreamConn{
@@ -335,7 +334,7 @@ func TestSendACKPacketFormat(t *testing.T) {
 
 // TestProcessSynAck verifies SYN-ACK processing logic.
 func TestProcessSynAck(t *testing.T) {
-	recvBuf, err := circbuf.NewBuffer(1024)
+	recvBuf, err := NewBuffer(1024)
 	require.NoError(t, err)
 
 	// Simulate state after SYN was sent: sendSeq has been incremented
@@ -370,7 +369,7 @@ func TestProcessSynAck(t *testing.T) {
 // TestProcessSynAck_InvalidAckThrough verifies that SYN-ACK with wrong AckThrough is rejected.
 // Per ISSUE-010, the SYN-ACK's AckThrough must match our SYN's sequence number.
 func TestProcessSynAck_InvalidAckThrough(t *testing.T) {
-	recvBuf, err := circbuf.NewBuffer(1024)
+	recvBuf, err := NewBuffer(1024)
 	require.NoError(t, err)
 
 	// Simulate state after SYN was sent: sendSeq has been incremented
@@ -405,7 +404,7 @@ func TestProcessSynAck_InvalidAckThrough(t *testing.T) {
 // TestProcessSynAck_ZeroSequenceNumber verifies warning is logged for seq=0.
 // While technically valid (1 in 2^32 chance for random ISN), it's unusual and logged.
 func TestProcessSynAck_ZeroSequenceNumber(t *testing.T) {
-	recvBuf, err := circbuf.NewBuffer(1024)
+	recvBuf, err := NewBuffer(1024)
 	require.NoError(t, err)
 
 	// Simulate state after SYN was sent: sendSeq has been incremented

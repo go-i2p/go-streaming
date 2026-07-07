@@ -4,7 +4,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/armon/circbuf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -38,7 +37,7 @@ func TestChokeThresholdConstants(t *testing.T) {
 func newTestStreamConnForChoke(t *testing.T, bufferSize int) *StreamConn {
 	i2cp := RequireI2CP(t)
 
-	recvBuf, _ := circbuf.NewBuffer(int64(bufferSize))
+	recvBuf, _ := NewBuffer(int64(bufferSize))
 	s := &StreamConn{
 		session:           i2cp.Manager.session,
 		dest:              i2cp.Manager.Destination(),

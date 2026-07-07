@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/armon/circbuf"
 	go_i2cp "github.com/go-i2p/go-i2cp"
 )
 
@@ -115,7 +114,7 @@ func CreateTestStreamConn(t *testing.T) *StreamConn {
 
 	i2cp := RequireI2CP(t)
 
-	recvBuf, err := circbuf.NewBuffer(64 * 1024)
+	recvBuf, err := NewBuffer(64 * 1024)
 	if err != nil {
 		t.Fatalf("Failed to create receive buffer: %v", err)
 	}

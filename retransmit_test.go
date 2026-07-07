@@ -4,14 +4,13 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/armon/circbuf"
 	"github.com/stretchr/testify/require"
 )
 
 // newTestStreamConnForRetransmit creates a StreamConn for testing retransmission with real I2CP.
 func newTestStreamConnForRetransmit(t *testing.T) *StreamConn {
 	i2cp := RequireI2CP(t)
-	recvBuf, _ := circbuf.NewBuffer(1024)
+	recvBuf, _ := NewBuffer(1024)
 	s := &StreamConn{
 		session:           i2cp.Manager.session,
 		dest:              i2cp.Manager.Destination(),

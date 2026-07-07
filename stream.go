@@ -22,7 +22,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/armon/circbuf"
 	go_i2cp "github.com/go-i2p/go-i2cp"
 )
 
@@ -276,9 +275,10 @@ type StreamConn struct {
 	nackCounts map[uint32]int // Maps sequence number to NACK count received
 
 	// Simple byte buffers for MVP
-	// Using github.com/armon/circbuf for receive buffer to avoid wraparound bugs
+	// recvBuf uses RecvBuffer, a fixed-capacity FIFO buffer that rejects writes
+	// past capacity instead of silently overwriting unread data.
 	sendBuf []byte
-	recvBuf *circbuf.Buffer
+	recvBuf *RecvBuffer
 
 	// Receive loop coordination
 	recvChan chan *Packet       // Channel for incoming packets
@@ -492,7 +492,7 @@ func generateConnectionIdentifiers() (uint32, uint32, error) {
 // initializeStreamConn creates and initializes a StreamConn with the given parameters.
 // Sets up all fields, buffers, channels, and condition variables.
 func initializeStreamConn(session *go_i2cp.Session, manager *StreamManager, dest *go_i2cp.Destination,
-	localPort, remotePort uint16, mtu int, isn, localStreamID uint32, recvBuf *circbuf.Buffer,
+	localPort, remotePort uint16, mtu int, isn, localStreamID uint32, recvBuf *RecvBuffer,
 	ctx context.Context, cancel context.CancelFunc,
 ) *StreamConn {
 	conn := &StreamConn{
@@ -542,7 +542,7 @@ func createConnectionStruct(session *go_i2cp.Session, manager *StreamManager, de
 		return nil, err
 	}
 
-	recvBuf, err := circbuf.NewBuffer(64 * 1024) // 64KB receive buffer
+	recvBuf, err := NewBuffer(64 * 1024) // 64KB receive buffer
 	if err != nil {
 		return nil, fmt.Errorf("create receive buffer: %w", err)
 	}
@@ -1166,7 +1166,7 @@ func (l *StreamListener) createIncomingConnection(synPkt *Packet, remotePort uin
 		return nil, fmt.Errorf("generate stream ID: %w", err)
 	}
 
-	recvBuf, err := circbuf.NewBuffer(64 * 1024)
+	recvBuf, err := NewBuffer(64 * 1024)
 	if err != nil {
 		return nil, fmt.Errorf("create receive buffer: %w", err)
 	}
@@ -1176,7 +1176,7 @@ func (l *StreamListener) createIncomingConnection(synPkt *Packet, remotePort uin
 }
 
 // initConnectionState creates a new StreamConn with initialized state from handshake parameters.
-func (l *StreamListener) initConnectionState(synPkt *Packet, remotePort uint16, peerDest *go_i2cp.Destination, isn, localStreamID uint32, recvBuf *circbuf.Buffer) *StreamConn {
+func (l *StreamListener) initConnectionState(synPkt *Packet, remotePort uint16, peerDest *go_i2cp.Destination, isn, localStreamID uint32, recvBuf *RecvBuffer) *StreamConn {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn := &StreamConn{
 		manager:           l.manager,
@@ -2583,8 +2583,8 @@ func (s *StreamConn) sendProbePacketLocked() {
 	// Build a minimal probe packet with 1 byte of data
 	// This is just enough to trigger an ACK response from the peer
 	pkt := &Packet{
-		SendStreamID: s.remoteStreamID,
-		RecvStreamID: s.localStreamID,
+		SendStreamID: s.localStreamID,
+		RecvStreamID: s.remoteStreamID,
 		SequenceNum:  s.sendSeq,
 		AckThrough:   s.recvSeq - 1,
 		Payload:      []byte{0}, // Minimal probe payload

@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/armon/circbuf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -14,7 +13,7 @@ import (
 // newTestStreamConnForTimeout creates a StreamConn for timeout testing
 func newTestStreamConnForTimeout() *StreamConn {
 	ctx, cancel := context.WithCancel(context.Background())
-	recvBuf, _ := circbuf.NewBuffer(4096)
+	recvBuf, _ := NewBuffer(4096)
 
 	conn := &StreamConn{
 		state:             StateEstablished,

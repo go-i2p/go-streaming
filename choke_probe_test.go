@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/armon/circbuf"
 	"github.com/stretchr/testify/require"
 )
 
@@ -21,7 +20,7 @@ func newTestStreamConnForChokeProbe(t *testing.T) *StreamConn {
 
 	i2cp := RequireI2CP(t)
 
-	recvBuf, err := circbuf.NewBuffer(64 * 1024)
+	recvBuf, err := NewBuffer(64 * 1024)
 	require.NoError(t, err)
 
 	s := &StreamConn{
@@ -195,7 +194,7 @@ func TestSendProbePacketLocked(t *testing.T) {
 
 // TestPersistTimerNoSessionNoStart verifies timer doesn't start without session.
 func TestPersistTimerNoSessionNoStart(t *testing.T) {
-	recvBuf, _ := circbuf.NewBuffer(1024)
+	recvBuf, _ := NewBuffer(1024)
 	s := &StreamConn{
 		session:        nil, // No session
 		localStreamID:  100,

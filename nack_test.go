@@ -4,7 +4,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/armon/circbuf"
 	"github.com/stretchr/testify/require"
 )
 
@@ -25,7 +24,7 @@ func nackMapContains(m map[uint32]struct{}, seq uint32) bool {
 
 // newTestStreamConn creates a minimal StreamConn for testing NACK functionality.
 func newTestStreamConn(recvSeq uint32) *StreamConn {
-	recvBuf, _ := circbuf.NewBuffer(1024)
+	recvBuf, _ := NewBuffer(1024)
 	s := &StreamConn{
 		recvSeq:           recvSeq,
 		recvBuf:           recvBuf,
@@ -289,7 +288,7 @@ func TestNACKListUpdates(t *testing.T) {
 // when there are missing sequences.
 func TestNACKInclusionInACKPackets(t *testing.T) {
 	i2cp := RequireI2CP(t)
-	recvBuf, err := circbuf.NewBuffer(1024)
+	recvBuf, err := NewBuffer(1024)
 	require.NoError(t, err)
 
 	s := &StreamConn{
@@ -323,7 +322,7 @@ func TestNACKInclusionInACKPackets(t *testing.T) {
 // TestNACKLimit255 verifies that no more than 255 NACKs are included per packet.
 func TestNACKLimit255(t *testing.T) {
 	i2cp := RequireI2CP(t)
-	recvBuf, err := circbuf.NewBuffer(1024)
+	recvBuf, err := NewBuffer(1024)
 	require.NoError(t, err)
 
 	s := &StreamConn{

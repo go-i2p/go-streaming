@@ -4,13 +4,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/armon/circbuf"
 	"github.com/stretchr/testify/require"
 )
 
 // newTestStreamConnForSlowStart creates a StreamConn for testing slow start behavior.
 func newTestStreamConnForSlowStart() *StreamConn {
-	recvBuf, _ := circbuf.NewBuffer(1024)
+	recvBuf, _ := NewBuffer(1024)
 	s := &StreamConn{
 		localStreamID:  100,
 		remoteStreamID: 200,

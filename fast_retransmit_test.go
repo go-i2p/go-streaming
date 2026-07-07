@@ -4,7 +4,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/armon/circbuf"
 	"github.com/stretchr/testify/require"
 )
 
@@ -12,7 +11,7 @@ import (
 // It sets up the necessary fields for NACK handling including nackCounts tracking.
 func newTestStreamConnForFastRetransmit(t *testing.T) *StreamConn {
 	i2cp := RequireI2CP(t)
-	recvBuf, _ := circbuf.NewBuffer(1024)
+	recvBuf, _ := NewBuffer(1024)
 	s := &StreamConn{
 		session:           i2cp.Manager.session,
 		dest:              i2cp.Manager.Destination(),
@@ -236,7 +235,7 @@ func TestNoRetransmitForMissingPacket(t *testing.T) {
 // TestNACKCountsMapInitialization verifies that handleNACKsLocked initializes
 // the nackCounts map if it's nil (backward compatibility).
 func TestNACKCountsMapInitialization(t *testing.T) {
-	recvBuf, _ := circbuf.NewBuffer(1024)
+	recvBuf, _ := NewBuffer(1024)
 	s := &StreamConn{
 		recvBuf:     recvBuf,
 		nackCounts:  nil, // Explicitly nil

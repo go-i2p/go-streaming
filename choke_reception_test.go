@@ -5,13 +5,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/armon/circbuf"
 	"github.com/stretchr/testify/require"
 )
 
 // newTestStreamConnForChokeReception creates a StreamConn for testing choke reception.
 func newTestStreamConnForChokeReception() *StreamConn {
-	recvBuf, _ := circbuf.NewBuffer(1024)
+	recvBuf, _ := NewBuffer(1024)
 	s := &StreamConn{
 		localStreamID:  100,
 		remoteStreamID: 200,
