@@ -3,16 +3,16 @@ module github.com/go-i2p/go-streaming
 go 1.26.8
 
 require (
-	github.com/go-i2p/common v0.1.70000
-	github.com/go-i2p/go-i2cp v0.1.70000
-	github.com/go-i2p/logger v0.1.70000
+	github.com/go-i2p/common v0.1.70001
+	github.com/go-i2p/go-i2cp v0.1.70001
+	github.com/go-i2p/logger v0.1.70001
 	github.com/stretchr/testify v1.12.1
 )
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/go-i2p/crypto v0.1.70000 // indirect
+	github.com/go-i2p/crypto v0.1.70001 // indirect
 	github.com/oklog/ulid/v2 v2.1.2 // indirect
 	github.com/samber/lo v1.53.0 // indirect
 	github.com/samber/oops v1.23.1 // indirect
