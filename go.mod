@@ -1,6 +1,6 @@
 module github.com/go-i2p/go-streaming
 
-go 1.26.3
+go 1.26.8
 
 require (
 	github.com/go-i2p/common v0.1.60000-0.20260701134558-e5f5cf65a7f5
