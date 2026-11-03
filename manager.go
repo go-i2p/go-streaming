@@ -82,6 +82,7 @@ type lookupResult struct {
 type connKey struct {
 	localPort  uint16
 	remotePort uint16
+	peerDest   *go_i2cp.Destination
 	// remoteAddr would go here if we had peer addressing
 }
 
@@ -367,8 +368,8 @@ func (sm *StreamManager) LookupDestination(ctx context.Context, hostname string)
 }
 
 // RegisterConnection registers a connection for incoming packet routing.
-func (sm *StreamManager) RegisterConnection(localPort, remotePort uint16, conn *StreamConn) {
-	key := connKey{localPort: localPort, remotePort: remotePort}
+func (sm *StreamManager) RegisterConnection(localPort, remotePort uint16, peerDest *go_i2cp.Destination, conn *StreamConn) {
+	key := connKey{localPort: localPort, remotePort: remotePort, peerDest: peerDest}
 	sm.connections.Store(key, conn)
 	log.WithFields(map[string]interface{}{
 		"localPort":  localPort,
@@ -377,8 +378,8 @@ func (sm *StreamManager) RegisterConnection(localPort, remotePort uint16, conn *
 }
 
 // UnregisterConnection removes a connection registration.
-func (sm *StreamManager) UnregisterConnection(localPort, remotePort uint16) {
-	key := connKey{localPort: localPort, remotePort: remotePort}
+func (sm *StreamManager) UnregisterConnection(localPort, remotePort uint16, peerDest *go_i2cp.Destination) {
+	key := connKey{localPort: localPort, remotePort: remotePort, peerDest: peerDest}
 	sm.connections.Delete(key)
 	log.WithFields(map[string]interface{}{
 		"localPort":  localPort,
@@ -809,7 +810,7 @@ func (sm *StreamManager) handleSynPacket(pkt *Packet, incoming *incomingPacket) 
 
 // routeToConnection routes a packet to an existing connection or sends RESET.
 func (sm *StreamManager) routeToConnection(pkt *Packet, incoming *incomingPacket) {
-	key := connKey{localPort: incoming.destPort, remotePort: incoming.srcPort}
+	key := connKey{localPort: incoming.destPort, remotePort: incoming.srcPort, peerDest: incoming.srcDest}
 	if connIface, ok := sm.connections.Load(key); ok {
 		conn := connIface.(*StreamConn)
 		conn.handleIncomingPacket(pkt)

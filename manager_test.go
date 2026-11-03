@@ -110,7 +110,7 @@ func TestStreamManager_ConnectionRegistration(t *testing.T) {
 	}
 
 	// Register connection
-	manager.RegisterConnection(localPort, remotePort, conn)
+	manager.RegisterConnection(localPort, remotePort, manager.Session().Destination(), conn)
 
 	// Create data packet for this connection
 	dataPkt := &Packet{
@@ -142,7 +142,7 @@ func TestStreamManager_ConnectionRegistration(t *testing.T) {
 	}
 
 	// Unregister connection
-	manager.UnregisterConnection(localPort, remotePort)
+	manager.UnregisterConnection(localPort, remotePort, manager.Session().Destination())
 }
 
 // TestStreamManager_PacketFiltering verifies non-streaming protocols are filtered.
@@ -282,7 +282,7 @@ func TestStreamManager_SendResetPacket_UnknownConnection(t *testing.T) {
 	// Ensure no connection registered for test ports
 	const localPort uint16 = 8888
 	const remotePort uint16 = 7777
-	manager.UnregisterConnection(localPort, remotePort)
+	manager.UnregisterConnection(localPort, remotePort, manager.Session().Destination())
 
 	// Create a data packet (non-SYN) for an unknown connection
 	dataPkt := &Packet{
@@ -415,7 +415,7 @@ func TestStreamManager_DispatchPacket_RESETOnUnknownConnection(t *testing.T) {
 	// Ensure no connection on test ports
 	const localPort uint16 = 6543
 	const remotePort uint16 = 3456
-	manager.UnregisterConnection(localPort, remotePort)
+	manager.UnregisterConnection(localPort, remotePort, manager.Session().Destination())
 
 	// Create incoming data packet (not a SYN)
 	dataPkt := &Packet{
@@ -601,7 +601,7 @@ func TestStreamManager_FromSessionMessageRouting(t *testing.T) {
 		cancel:     cancel,
 	}
 
-	manager.RegisterConnection(localPort, remotePort, conn)
+	manager.RegisterConnection(localPort, remotePort, manager.Session().Destination(), conn)
 
 	// Create and send a test packet through the callback
 	dataPkt := &Packet{
