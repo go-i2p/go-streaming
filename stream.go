@@ -433,11 +433,11 @@ func DialWithManager(manager *StreamManager, dest *go_i2cp.Destination, localPor
 	}
 
 	// Register connection with manager BEFORE handshake so SYN-ACK can be routed
-	manager.RegisterConnection(localPort, remotePort, conn)
+	manager.RegisterConnection(localPort, remotePort, dest, conn)
 
 	// Perform handshake
 	if err := performHandshake(conn, DefaultConnectTimeout); err != nil {
-		manager.UnregisterConnection(localPort, remotePort)
+		manager.UnregisterConnection(localPort, remotePort, dest)
 		return nil, err
 	}
 
@@ -1104,13 +1104,16 @@ func (l *StreamListener) validateSYNSource(synPkt *Packet, remoteDest *go_i2cp.D
 // verifySYNSignature verifies the signature on a SYN packet if present.
 // Returns an error if verification fails.
 func (l *StreamListener) verifySYNSignature(synPkt *Packet) error {
+	// return an error if no flag is included
 	if synPkt.Flags&FlagSignatureIncluded == 0 {
-		return nil
+		return fmt.Errorf("SYN signature verification failed - no signature flag included")
 	}
+
 	if err := VerifyPacketSignature(synPkt, nil); err != nil {
 		log.WithError(err).Warn("SYN signature verification failed - rejecting packet")
 		return fmt.Errorf("SYN signature verification failed: %w", err)
 	}
+
 	log.Debug("SYN signature verified successfully")
 	return nil
 }
@@ -1249,7 +1252,7 @@ func (l *StreamListener) queueConnectionForAccept(conn *StreamConn, remotePort u
 		log.Warn("accept channel full, dropping connection")
 		conn.cancel()
 		if l.manager != nil {
-			l.manager.UnregisterConnection(l.localPort, remotePort)
+			l.manager.UnregisterConnection(l.localPort, remotePort, conn.dest)
 		}
 		return fmt.Errorf("accept queue full")
 	}
@@ -1363,12 +1366,12 @@ func (l *StreamListener) validateIncomingSYN(synPkt *Packet, remoteDest *go_i2cp
 // finalizeIncomingConnection registers the connection, sends SYN-ACK, and starts the receive loop.
 func (l *StreamListener) finalizeIncomingConnection(conn *StreamConn, remotePort uint16) error {
 	if l.manager != nil {
-		l.manager.RegisterConnection(l.localPort, remotePort, conn)
+		l.manager.RegisterConnection(l.localPort, remotePort, conn.dest, conn)
 	}
 
 	if err := conn.sendSynAck(); err != nil {
 		if l.manager != nil {
-			l.manager.UnregisterConnection(l.localPort, remotePort)
+			l.manager.UnregisterConnection(l.localPort, remotePort, conn.dest)
 		}
 		return fmt.Errorf("send SYN-ACK: %w", err)
 	}
@@ -2262,14 +2265,22 @@ func (s *StreamConn) handleFinalAckLocked(pkt *Packet) error {
 func (s *StreamConn) handleCloseLocked(pkt *Packet) error {
 	log.Debug("received CLOSE")
 
-	// Verify CLOSE signature if present
-	if pkt.Flags&FlagSignatureIncluded != 0 {
-		if err := VerifyPacketSignature(pkt, nil); err != nil {
-			log.WithError(err).Warn("CLOSE signature verification failed - rejecting packet")
-			return fmt.Errorf("CLOSE signature verification failed: %w", err)
-		}
-		log.Debug("CLOSE signature verified successfully")
+	if pkt.Flags&FlagSignatureIncluded == 0 {
+		return fmt.Errorf("CLOSE signature verification failed - no signature flag included")
 	}
+
+	// ensures the signature is coming from the established peer
+	if pkt.FromDestination != s.dest {
+		return fmt.Errorf("CLOSE signature verification failed - destination mismatch")
+	}
+
+	// Verify CLOSE signature if present
+	if err := VerifyPacketSignature(pkt, nil); err != nil {
+		log.WithError(err).Warn("CLOSE signature verification failed - rejecting packet")
+		return fmt.Errorf("CLOSE signature verification failed: %w", err)
+	}
+
+	log.Debug("CLOSE signature verified successfully")
 
 	switch s.state {
 	case StateEstablished:
@@ -2299,14 +2310,21 @@ func (s *StreamConn) handleCloseLocked(pkt *Packet) error {
 func (s *StreamConn) handleResetLocked(pkt *Packet) error {
 	log.Warn("received RESET - aborting connection")
 
-	// Verify RESET signature if present
-	if pkt.Flags&FlagSignatureIncluded != 0 {
-		if err := VerifyPacketSignature(pkt, nil); err != nil {
-			log.WithError(err).Warn("RESET signature verification failed - rejecting packet")
-			return fmt.Errorf("RESET signature verification failed: %w", err)
-		}
-		log.Debug("RESET signature verified successfully")
+	if pkt.Flags&FlagSignatureIncluded == 0 {
+		return fmt.Errorf("RESET signature verification failed - no signature flag included")
 	}
+
+	// ensures the signature is coming from the established peer
+	if pkt.FromDestination != s.dest {
+		return fmt.Errorf("RESET signature verification failed - destination mismatch")
+	}
+
+	// Verify RESET signature if present
+	if err := VerifyPacketSignature(pkt, nil); err != nil {
+		log.WithError(err).Warn("RESET signature verification failed - rejecting packet")
+		return fmt.Errorf("RESET signature verification failed: %w", err)
+	}
+	log.Debug("RESET signature verified successfully")
 
 	s.setState(StateClosed)
 	s.closed = true
@@ -3321,7 +3339,7 @@ func (s *StreamConn) cleanupConnectionLocked() {
 	}
 
 	if s.manager != nil {
-		s.manager.UnregisterConnection(s.localPort, s.remotePort)
+		s.manager.UnregisterConnection(s.localPort, s.remotePort, s.dest)
 		// Decrement active stream count for connection limiting
 		if s.manager.limiter != nil {
 			s.manager.limiter.ConnectionClosed()
