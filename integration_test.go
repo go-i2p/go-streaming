@@ -244,13 +244,13 @@ func TestEndToEnd_ConnectionMultiplexing(t *testing.T) {
 		conn.recvCond = sync.NewCond(&conn.mu)
 
 		// Register with manager
-		manager.RegisterConnection(8080, conn.remotePort, conn)
+		manager.RegisterConnection(8080, conn.remotePort, manager.Session().Destination(), conn)
 		connections[i] = conn
 	}
 
 	// Verify all connections are registered
 	for i, conn := range connections {
-		key := connKey{localPort: 8080, remotePort: conn.remotePort}
+		key := connKey{localPort: 8080, remotePort: conn.remotePort, streamID: conn.localStreamID}
 		if connIface, ok := manager.connections.Load(key); ok {
 			retrievedConn := connIface.(*StreamConn)
 			assert.Equal(t, conn.remotePort, retrievedConn.remotePort, "Connection %d", i)
@@ -286,7 +286,7 @@ func TestEndToEnd_ConnectionMultiplexing(t *testing.T) {
 
 	// Cleanup
 	for _, conn := range connections {
-		manager.UnregisterConnection(8080, conn.remotePort)
+		manager.UnregisterConnection(8080, conn.remotePort, manager.Session().Destination())
 		conn.Close()
 	}
 
@@ -466,6 +466,7 @@ func TestEndToEnd_CloseHandshake(t *testing.T) {
 		Payload:      nil,
 	}
 
+	signTestPeerPacket(t, conn, closePkt)
 	conn.recvChan <- closePkt
 
 	// Give receive loop time to process
@@ -525,7 +526,7 @@ func TestEndToEnd_ConcurrentStressTest(t *testing.T) {
 				}
 				conn.recvCond = sync.NewCond(&conn.mu)
 
-				manager.RegisterConnection(8080, port, conn)
+				manager.RegisterConnection(8080, port, manager.Session().Destination(), conn)
 				time.Sleep(time.Microsecond)
 			}
 		}(i)
@@ -538,7 +539,7 @@ func TestEndToEnd_ConcurrentStressTest(t *testing.T) {
 			for j := 0; j < opsPerGoroutine; j++ {
 				port := uint16(10000 + id*100 + j)
 				time.Sleep(time.Microsecond * 2)
-				manager.UnregisterConnection(8080, port)
+				manager.UnregisterConnection(8080, port, manager.Session().Destination())
 			}
 		}(i)
 	}
@@ -1216,13 +1217,13 @@ func Benchmark_EndToEnd_ConnectionLookup(b *testing.B) {
 			cancel:     cancel,
 		}
 		conn.recvCond = sync.NewCond(&conn.mu)
-		manager.RegisterConnection(8080, port, conn)
+		manager.RegisterConnection(8080, port, manager.Session().Destination(), conn)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		port := uint16(10000 + (i % 100))
-		key := connKey{localPort: 8080, remotePort: port}
+		key := connKey{localPort: 8080, remotePort: port, streamID: 0}
 		manager.connections.Load(key)
 	}
 }

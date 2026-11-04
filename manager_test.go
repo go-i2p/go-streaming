@@ -100,13 +100,16 @@ func TestStreamManager_ConnectionRegistration(t *testing.T) {
 	defer cancel()
 
 	conn := &StreamConn{
-		manager:    manager,
-		session:    manager.Session(),
-		localPort:  localPort,
-		remotePort: remotePort,
-		recvChan:   make(chan *Packet, 32),
-		ctx:        ctx,
-		cancel:     cancel,
+		manager:        manager,
+		session:        manager.Session(),
+		localPort:      localPort,
+		remotePort:     remotePort,
+		localStreamID:  uint32(localPort),
+		remoteStreamID: uint32(remotePort),
+		dest:           manager.Session().Destination(),
+		recvChan:       make(chan *Packet, 32),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 
 	// Register connection
@@ -592,13 +595,16 @@ func TestStreamManager_FromSessionMessageRouting(t *testing.T) {
 	defer cancel()
 
 	conn := &StreamConn{
-		manager:    manager,
-		session:    session,
-		localPort:  localPort,
-		remotePort: remotePort,
-		recvChan:   make(chan *Packet, 32),
-		ctx:        ctx,
-		cancel:     cancel,
+		manager:        manager,
+		session:        session,
+		localPort:      localPort,
+		remotePort:     remotePort,
+		localStreamID:  uint32(localPort),
+		remoteStreamID: uint32(remotePort),
+		dest:           manager.Session().Destination(),
+		recvChan:       make(chan *Packet, 32),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 
 	manager.RegisterConnection(localPort, remotePort, manager.Session().Destination(), conn)

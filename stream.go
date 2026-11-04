@@ -305,9 +305,11 @@ type StreamConn struct {
 	remoteProfile StreamProfile // Peer's profile (extracted from incoming SYN)
 
 	// Connection state and synchronization
-	mu     sync.Mutex // Protects all fields above
-	closed bool
-	state  ConnState
+	mu          sync.Mutex // Protects all fields above
+	closed      bool
+	state       ConnState
+	cleanupDone bool
+	limiter     *connectionLimiter
 }
 
 // StreamListener listens for and accepts incoming streaming connections.
@@ -437,7 +439,7 @@ func DialWithManager(manager *StreamManager, dest *go_i2cp.Destination, localPor
 
 	// Perform handshake
 	if err := performHandshake(conn, DefaultConnectTimeout); err != nil {
-		manager.UnregisterConnection(localPort, remotePort, dest)
+		manager.unregisterConnection(conn)
 		return nil, err
 	}
 
@@ -837,7 +839,7 @@ func (s *StreamConn) validateRemoteSequenceNum(pkt *Packet) {
 // Per I2P spec, server includes MaxPacketSize in SYN-ACK with FlagMaxPacketSizeIncluded flag.
 func (s *StreamConn) extractRemoteMTUFromSynAck(pkt *Packet) {
 	if pkt.Flags&FlagMaxPacketSizeIncluded != 0 && pkt.MaxPacketSize > 0 {
-		s.remoteMTU = pkt.MaxPacketSize
+		s.remoteMTU = max(pkt.MaxPacketSize, uint16(MinMTU))
 		log.WithFields(map[string]interface{}{
 			"remoteMTU":     s.remoteMTU,
 			"localMTU":      s.localMTU,
@@ -933,7 +935,7 @@ func (s *StreamConn) getNegotiatedMTU() uint16 {
 	if s.localMTU < s.remoteMTU {
 		return s.localMTU
 	}
-	return s.remoteMTU
+	return max(s.remoteMTU, uint16(MinMTU))
 }
 
 // Listen creates a StreamListener that accepts incoming connections on the specified port.
@@ -1037,9 +1039,19 @@ func (l *StreamListener) Accept() (net.Conn, error) {
 	l.mu.Unlock()
 
 	// Wait for incoming connection
-	conn, ok := <-l.acceptChan
-	if !ok {
-		return nil, fmt.Errorf("listener closed")
+	var conn *StreamConn
+	for {
+		var ok bool
+		conn, ok = <-l.acceptChan
+		if !ok {
+			return nil, fmt.Errorf("listener closed")
+		}
+		conn.mu.Lock()
+		closed := conn.closed
+		conn.mu.Unlock()
+		if !closed {
+			break
+		}
 	}
 
 	log.WithFields(map[string]interface{}{
@@ -1150,7 +1162,7 @@ func extractRemoteMTU(synPkt *Packet, localMTU uint16) uint16 {
 			"remoteMTU": synPkt.MaxPacketSize,
 			"localMTU":  localMTU,
 		}).Debug("extracted MTU from SYN")
-		return synPkt.MaxPacketSize
+		return max(synPkt.MaxPacketSize, uint16(MinMTU))
 	}
 	log.Warn("SYN missing MTU, using default")
 	return DefaultMTU
@@ -1183,6 +1195,7 @@ func (l *StreamListener) initConnectionState(synPkt *Packet, remotePort uint16, 
 	ctx, cancel := context.WithCancel(context.Background())
 	conn := &StreamConn{
 		manager:           l.manager,
+		limiter:           l.limiter,
 		session:           l.session,
 		dest:              peerDest,
 		localPort:         l.localPort,
@@ -1252,7 +1265,7 @@ func (l *StreamListener) queueConnectionForAccept(conn *StreamConn, remotePort u
 		log.Warn("accept channel full, dropping connection")
 		conn.cancel()
 		if l.manager != nil {
-			l.manager.UnregisterConnection(l.localPort, remotePort, conn.dest)
+			l.manager.unregisterConnection(conn)
 		}
 		return fmt.Errorf("accept queue full")
 	}
@@ -1266,27 +1279,30 @@ func (l *StreamListener) handleIncomingSYN(synPkt *Packet, remotePort uint16, re
 		"localPort":  l.localPort,
 	}).Debug("received SYN")
 
-	// Check access list before anything else
-	if err := l.checkAccessFilter(remoteDest, synPkt); err != nil {
-		return err
-	}
-
-	// Check connection limits before processing
-	if err := l.checkConnectionLimits(remoteDest, synPkt); err != nil {
-		return err
-	}
-
 	if err := l.validateIncomingSYN(synPkt, remoteDest); err != nil {
 		return err
 	}
-
 	peerDest, _ := l.validateSYNSource(synPkt, remoteDest)
-	conn, err := l.createIncomingConnection(synPkt, remotePort, peerDest)
-	if err != nil {
+	if err := l.checkAccessFilter(peerDest, synPkt); err != nil {
 		return err
 	}
-
-	return l.finalizeIncomingConnection(conn, remotePort)
+	if err := l.checkConnectionLimits(peerDest, synPkt); err != nil {
+		return err
+	}
+	conn, err := l.createIncomingConnection(synPkt, remotePort, peerDest)
+	if err != nil {
+		if l.limiter != nil {
+			l.limiter.ConnectionClosed()
+		}
+		return err
+	}
+	if err := l.finalizeIncomingConnection(conn, remotePort); err != nil {
+		conn.mu.Lock()
+		conn.cleanupConnectionLocked()
+		conn.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // checkAccessFilter verifies that the remote destination is allowed to connect.
@@ -1371,12 +1387,14 @@ func (l *StreamListener) finalizeIncomingConnection(conn *StreamConn, remotePort
 
 	if err := conn.sendSynAck(); err != nil {
 		if l.manager != nil {
-			l.manager.UnregisterConnection(l.localPort, remotePort, conn.dest)
+			l.manager.unregisterConnection(conn)
 		}
 		return fmt.Errorf("send SYN-ACK: %w", err)
 	}
 
+	conn.mu.Lock()
 	conn.setState(StateSynRcvd)
+	conn.mu.Unlock()
 	go conn.receiveLoop()
 
 	return l.queueConnectionForAccept(conn, remotePort)
@@ -2109,15 +2127,27 @@ func (s *StreamConn) GetInactivityTimeout() time.Duration {
 	return s.inactivityTimeout
 }
 
-func (s *StreamConn) receiveLoop() {
+func (s *StreamConn) receiveLoop() { s.receiveLoopWithHandshakeTimeout(DefaultHandshakeTimeout) }
+
+func (s *StreamConn) receiveLoopWithHandshakeTimeout(timeout time.Duration) {
 	log.Debug("receive loop started")
 	defer log.Debug("receive loop stopped")
 
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	for {
 		select {
+		case <-timer.C:
+			s.mu.Lock()
+			if s.state == StateSynRcvd {
+				s.setState(StateClosed)
+				s.cleanupConnectionLocked()
+				s.mu.Unlock()
+				return
+			}
+			s.mu.Unlock()
 		case <-s.ctx.Done():
 			return
-
 		case pkt := <-s.recvChan:
 			// Process packet from manager
 			if err := s.processPacket(pkt); err != nil {
@@ -2193,6 +2223,7 @@ func (s *StreamConn) handleSynAckLocked(pkt *Packet) error {
 		return fmt.Errorf("unexpected SYN-ACK")
 	}
 
+	s.remoteStreamID = pkt.SendStreamID
 	log.WithField("remoteSeq", pkt.SequenceNum).Debug("received SYN-ACK")
 
 	// Extract remote ISN and MTU
@@ -2200,7 +2231,7 @@ func (s *StreamConn) handleSynAckLocked(pkt *Packet) error {
 
 	// Extract MTU from packet if present (FlagMaxPacketSizeIncluded)
 	if pkt.Flags&FlagMaxPacketSizeIncluded != 0 && pkt.MaxPacketSize > 0 {
-		s.remoteMTU = pkt.MaxPacketSize
+		s.remoteMTU = max(pkt.MaxPacketSize, uint16(MinMTU))
 		log.WithFields(map[string]interface{}{
 			"remoteMTU":     s.remoteMTU,
 			"localMTU":      s.localMTU,
@@ -2270,7 +2301,7 @@ func (s *StreamConn) handleCloseLocked(pkt *Packet) error {
 	}
 
 	// ensures the signature is coming from the established peer
-	if pkt.FromDestination != s.dest {
+	if pkt.FromDestination == nil || s.dest == nil || pkt.FromDestination.Base64() != s.dest.Base64() {
 		return fmt.Errorf("CLOSE signature verification failed - destination mismatch")
 	}
 
@@ -2289,14 +2320,12 @@ func (s *StreamConn) handleCloseLocked(pkt *Packet) error {
 			log.WithError(err).Warn("failed to send CLOSE response")
 		}
 		s.setState(StateClosed)
-		s.closed = true
-		s.recvCond.Broadcast() // Wake readers to return io.EOF
+		s.cleanupConnectionLocked()
 
 	case StateClosing:
 		// Peer responded to our close
 		s.setState(StateClosed)
-		s.closed = true
-		s.recvCond.Broadcast()
+		s.cleanupConnectionLocked()
 
 	default:
 		log.WithField("state", s.state.String()).Warn("unexpected CLOSE")
@@ -2315,7 +2344,7 @@ func (s *StreamConn) handleResetLocked(pkt *Packet) error {
 	}
 
 	// ensures the signature is coming from the established peer
-	if pkt.FromDestination != s.dest {
+	if pkt.FromDestination == nil || s.dest == nil || pkt.FromDestination.Base64() != s.dest.Base64() {
 		return fmt.Errorf("RESET signature verification failed - destination mismatch")
 	}
 
@@ -2327,8 +2356,7 @@ func (s *StreamConn) handleResetLocked(pkt *Packet) error {
 	log.Debug("RESET signature verified successfully")
 
 	s.setState(StateClosed)
-	s.closed = true
-	s.recvCond.Broadcast()
+	s.cleanupConnectionLocked()
 
 	return fmt.Errorf("connection reset by peer")
 }
@@ -2701,6 +2729,9 @@ func (s *StreamConn) handleAckLocked(pkt *Packet) error {
 // Must be called with s.mu held.
 func (s *StreamConn) handleBufferFullLocked(pkt *Packet, seq uint32) error {
 	log.Warn("receive buffer full - buffering packet for later")
+	if len(pkt.Payload) > ECIESMTU || uint32(seq-s.recvSeq) >= MaxWindowSize || len(s.outOfOrderPackets) >= MaxWindowSize {
+		return nil
+	}
 	s.outOfOrderPackets[seq] = pkt
 
 	if !s.sendingChoke {
@@ -2793,6 +2824,9 @@ func (s *StreamConn) handleOutOfOrderPacketLocked(pkt *Packet, seq uint32) error
 		"got":      seq,
 	}).Debug("out-of-order packet - buffering")
 
+	if len(pkt.Payload) > ECIESMTU || uint32(seq-s.recvSeq) >= MaxWindowSize || len(s.outOfOrderPackets) >= MaxWindowSize {
+		return nil
+	}
 	s.outOfOrderPackets[seq] = pkt
 	s.removeFromNACKListLocked(seq)
 	s.updateNACKListLocked(seq)
@@ -3268,7 +3302,7 @@ func (s *StreamConn) getNegotiatedMTULocked() uint16 {
 	if s.localMTU < s.remoteMTU {
 		return s.localMTU
 	}
-	return s.remoteMTU
+	return max(s.remoteMTU, uint16(MinMTU))
 }
 
 // Close closes the connection and releases resources.
@@ -3329,6 +3363,10 @@ func (s *StreamConn) sendCloseIfEstablished() {
 // cancels the receive loop, marks as closed, and wakes blocked goroutines.
 // Must be called with s.mu held.
 func (s *StreamConn) cleanupConnectionLocked() {
+	if s.cleanupDone {
+		return
+	}
+	s.cleanupDone = true
 	// Save TCB data before cleanup (RFC 2140 control block sharing)
 	// This allows subsequent connections to same peer to benefit from learned RTT/window
 	if s.manager != nil && s.manager.tcbCache != nil && s.dest != nil {
@@ -3339,13 +3377,16 @@ func (s *StreamConn) cleanupConnectionLocked() {
 	}
 
 	if s.manager != nil {
-		s.manager.UnregisterConnection(s.localPort, s.remotePort, s.dest)
+		s.manager.unregisterConnection(s)
 		// Decrement active stream count for connection limiting
-		if s.manager.limiter != nil {
+		if s.limiter == nil && s.manager.limiter != nil {
 			s.manager.limiter.ConnectionClosed()
 		}
 	}
 
+	if s.limiter != nil {
+		s.limiter.ConnectionClosed()
+	}
 	// Stop persist timer if running
 	s.stopPersistTimerLocked()
 
