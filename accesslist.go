@@ -150,17 +150,17 @@ func (af *accessFilter) IsAllowed(dest *go_i2cp.Destination) bool {
 		return true
 	}
 
-	// If no destination provided, we can't check - allow by default
+	// If no destination provided, we can't check - do not allow
 	if dest == nil {
-		log.Debug("no destination provided, allowing connection by default")
-		return true
+		log.Debug("rejecting connection: no destination provided")
+		return false
 	}
 
 	// Get the destination hash
 	destHash := hashDestinationForAccessList(dest)
 	if destHash == "" {
-		// Couldn't hash destination - allow by default
-		return true
+		// Couldn't hash destination - dont allow
+		return false
 	}
 
 	// Check if hash is in the set

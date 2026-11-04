@@ -2,6 +2,7 @@ package streaming
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
@@ -82,7 +83,7 @@ type lookupResult struct {
 type connKey struct {
 	localPort  uint16
 	remotePort uint16
-	// remoteAddr would go here if we had peer addressing
+	streamID   uint32 // Local random ID the connection holds the authenticated peer.
 }
 
 // incomingPacket represents a received I2CP message
@@ -367,8 +368,8 @@ func (sm *StreamManager) LookupDestination(ctx context.Context, hostname string)
 }
 
 // RegisterConnection registers a connection for incoming packet routing.
-func (sm *StreamManager) RegisterConnection(localPort, remotePort uint16, conn *StreamConn) {
-	key := connKey{localPort: localPort, remotePort: remotePort}
+func (sm *StreamManager) RegisterConnection(localPort, remotePort uint16, peerDest *go_i2cp.Destination, conn *StreamConn) {
+	key := connKey{localPort: localPort, remotePort: remotePort, streamID: conn.localStreamID}
 	sm.connections.Store(key, conn)
 	log.WithFields(map[string]interface{}{
 		"localPort":  localPort,
@@ -377,13 +378,22 @@ func (sm *StreamManager) RegisterConnection(localPort, remotePort uint16, conn *
 }
 
 // UnregisterConnection removes a connection registration.
-func (sm *StreamManager) UnregisterConnection(localPort, remotePort uint16) {
-	key := connKey{localPort: localPort, remotePort: remotePort}
-	sm.connections.Delete(key)
+func (sm *StreamManager) UnregisterConnection(localPort, remotePort uint16, peerDest *go_i2cp.Destination) {
+	sm.connections.Range(func(key, value any) bool {
+		c := value.(*StreamConn)
+		if c.localPort == localPort && c.remotePort == remotePort && (c.dest == peerDest || (c.dest != nil && peerDest != nil && c.dest.Base64() == peerDest.Base64())) {
+			sm.connections.CompareAndDelete(key, c)
+		}
+		return true
+	})
 	log.WithFields(map[string]interface{}{
 		"localPort":  localPort,
 		"remotePort": remotePort,
 	}).Debug("unregistered connection")
+}
+
+func (sm *StreamManager) unregisterConnection(c *StreamConn) {
+	sm.connections.CompareAndDelete(connKey{localPort: c.localPort, remotePort: c.remotePort, streamID: c.localStreamID}, c)
 }
 
 // handleIncomingMessage is called by I2CP when messages arrive.
@@ -598,6 +608,11 @@ func (sm *StreamManager) processPackets() {
 //  2. Existing connection (for established connections)
 //  3. Unknown destination (drop packet or send RESET)
 func (sm *StreamManager) dispatchPacket(incoming *incomingPacket) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.WithField("panic", r).Warn("dropping packet after dispatch panic")
+		}
+	}()
 	pkt, err := sm.unmarshalIncomingPacket(incoming)
 	if err != nil {
 		return
@@ -624,6 +639,14 @@ func (sm *StreamManager) dispatchPacket(incoming *incomingPacket) {
 // unmarshalIncomingPacket unmarshals the streaming packet from incoming payload.
 func (sm *StreamManager) unmarshalIncomingPacket(incoming *incomingPacket) (*Packet, error) {
 	pkt := &Packet{}
+	// A signed control packet may omit FROM. Resolve its verification identity
+	// from the existing stream, never from the unauthenticated I2CP callback.
+	if len(incoming.payload) >= 22 {
+		key := connKey{localPort: incoming.destPort, remotePort: incoming.srcPort, streamID: binary.BigEndian.Uint32(incoming.payload[4:8])}
+		if v, ok := sm.connections.Load(key); ok {
+			pkt.FromDestination = v.(*StreamConn).dest
+		}
+	}
 	if err := pkt.Unmarshal(incoming.payload); err != nil {
 		log.WithError(err).WithField("destPort", incoming.destPort).Warn("failed to unmarshal streaming packet")
 		return nil, err
@@ -809,10 +832,18 @@ func (sm *StreamManager) handleSynPacket(pkt *Packet, incoming *incomingPacket) 
 
 // routeToConnection routes a packet to an existing connection or sends RESET.
 func (sm *StreamManager) routeToConnection(pkt *Packet, incoming *incomingPacket) {
-	key := connKey{localPort: incoming.destPort, remotePort: incoming.srcPort}
+	key := connKey{localPort: incoming.destPort, remotePort: incoming.srcPort, streamID: pkt.RecvStreamID}
 	if connIface, ok := sm.connections.Load(key); ok {
 		conn := connIface.(*StreamConn)
-		conn.handleIncomingPacket(pkt)
+		conn.mu.Lock()
+		valid := pkt.SendStreamID != 0 && (conn.remoteStreamID == 0 || pkt.SendStreamID == conn.remoteStreamID)
+		if incoming.srcDest != nil && (conn.dest == nil || incoming.srcDest.Base64() != conn.dest.Base64()) {
+			valid = false
+		}
+		conn.mu.Unlock()
+		if valid {
+			conn.handleIncomingPacket(pkt)
+		}
 		return
 	}
 	log.WithFields(map[string]interface{}{
