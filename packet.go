@@ -627,6 +627,11 @@ func (p *Packet) unmarshalHeader(data []byte) (offset, optionsEnd int, err error
 		return 0, 0, err
 	}
 
+	// Check ensures we do not read an empty slice
+	if len(data) < offset+5 {
+		return 0, 0, fmt.Errorf("Packet is too short to unmarshal got %d bytes, need %d", len(data), offset+5)
+	}
+
 	// Read ResendDelay after NACKs (1 byte)
 	p.ResendDelay = data[offset]
 	offset++
