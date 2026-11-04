@@ -267,9 +267,9 @@ func TestAccessFilterNilDestination(t *testing.T) {
 	}
 	filter := newAccessFilter(config)
 
-	// nil destination should be allowed (can't verify, so fail safe)
-	if !filter.IsAllowed(nil) {
-		t.Error("expected nil destination to be allowed (fail safe)")
+	// nil destination should be rejected for security (prevent bypass of whitelist/blacklist)
+	if filter.IsAllowed(nil) {
+		t.Error("expected nil destination to be rejected")
 	}
 }
 

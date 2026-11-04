@@ -159,8 +159,8 @@ func (af *accessFilter) IsAllowed(dest *go_i2cp.Destination) bool {
 	// Get the destination hash
 	destHash := hashDestinationForAccessList(dest)
 	if destHash == "" {
-		// Couldn't hash destination - allow by default
-		return true
+		// Couldn't hash destination - dont allow
+		return false
 	}
 
 	// Check if hash is in the set
