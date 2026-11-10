@@ -4,7 +4,7 @@ go 1.26.8
 
 require (
 	github.com/go-i2p/common v0.1.70002-0.20261108230912-8737a0084f07
-	github.com/go-i2p/go-i2cp v0.1.70002-0.20261109163320-df0e73df5b59
+	github.com/go-i2p/go-i2cp v0.1.70002-0.20261109211031-bfcd48db3a61
 	github.com/go-i2p/logger v0.1.70001
 	github.com/stretchr/testify v1.12.1
 )
