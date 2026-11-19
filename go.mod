@@ -3,8 +3,8 @@ module github.com/go-i2p/go-streaming
 go 1.26.8
 
 require (
-	github.com/go-i2p/common v0.1.70002-0.20261118194241-62f47be3c537
-	github.com/go-i2p/go-i2cp v0.1.70002-0.20261118061512-7aeae1016db7
+	github.com/go-i2p/common v0.1.70002-0.20261119030747-fdf972457881
+	github.com/go-i2p/go-i2cp v0.1.70002-0.20261118212450-92f035b03b2c
 	github.com/go-i2p/logger v0.1.70001
 	github.com/stretchr/testify v1.12.1
 )
